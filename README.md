@@ -116,5 +116,3 @@ MiniQubes is about making compartmentalisation more accessible to people who wan
 ---
 
 Made for people who don't want to be watched.
-
-One thing worth keeping in mind: I’ve described features like lightweight isolation and compartmentalisation as goals rather than guaranteed capabilities, since your original README doesn’t specify exactly how MiniQubes implements them. Once those mechanisms are confirmed, the README can make more concrete security claims.
