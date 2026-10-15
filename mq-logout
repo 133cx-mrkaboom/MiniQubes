@@ -1,0 +1,12 @@
+#!/bin/sh
+# mq-logout - end the MiniQubes desktop session (asks labwc to exit, then makes sure it did).
+pid=${LABWC_PID:-}
+[ -n "$pid" ] || pid=$(cat "${XDG_RUNTIME_DIR:-/tmp}/miniqubes-session.pid" 2>/dev/null)
+labwc --exit >/dev/null 2>&1
+i=0
+while [ "$i" -lt 6 ]; do
+  { [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; } || exit 0
+  sleep 0.5; i=$((i + 1))
+done
+[ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null
+exit 0

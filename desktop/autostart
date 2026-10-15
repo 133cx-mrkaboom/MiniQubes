@@ -1,0 +1,18 @@
+#!/bin/sh
+# Started by labwc when the MiniQubes desktop starts. Edit freely.
+D="${MQ_DESKTOP:-$HOME/.config/miniqubes/desktop}"
+LP="${LABWC_PID:-$PPID}"   # the compositor: everything started here stops when it does
+
+# wallpaper: drop a wallpaper.png / wallpaper.jpg in the desktop folder to use a picture.
+# (swaybg is a plain background layer, it can't be clicked, so clicking the wallpaper does nothing)
+WALL=$(ls "$D"/wallpaper.png "$D"/wallpaper.jpg "$D"/wallpaper.jpeg 2>/dev/null | head -n1)
+if [ -n "$WALL" ]; then swaybg -m fill -i "$WALL" >/dev/null 2>&1 &
+else swaybg -c '#14161c' >/dev/null 2>&1 &
+fi
+
+# build the Launcher menu (qube -> apps) before the bar starts, then keep it up to date
+mq-menu --once >/dev/null 2>&1
+mq-menu --daemon "$LP" >/dev/null 2>&1 &
+
+# the bar; restarts itself if it crashes, but stops when the desktop ends (so sessions never pile up bars)
+( while kill -0 "$LP" 2>/dev/null; do waybar -c "$D/waybar.json" -s "$D/waybar.css"; sleep 1; done ) >/dev/null 2>&1 &

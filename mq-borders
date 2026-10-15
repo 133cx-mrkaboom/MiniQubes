@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""mq-borders - color Hyprland window borders by miniqubes box.
+
+Hyprland tells us which process owns each window; the process's MQ_BOX env var (set by
+`miniqubes run`) names the box, and the box's color comes from its config.
+
+Autostart: add to ~/.config/hypr/hyprland.conf
+    exec-once = /usr/local/bin/mq-borders
+Install:   sudo install -m755 mq-borders /usr/local/bin/
+"""
+import json
+import os
+import socket
+import subprocess
+import tomllib
+from pathlib import Path
+
+CONF = Path(os.environ.get("MQ_CONF", Path.home() / ".config/miniqubes/boxes"))
+BORDER = "4"
+
+
+def box_of(pid):
+    try:
+        env = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    except OSError:
+        return None
+    for e in env:
+        if e.startswith(b"MQ_BOX="):
+            return e[7:].decode()
+    return None
+
+
+def color_of(box):
+    try:
+        return tomllib.loads((CONF / f"{box}.toml").read_text())["color"].lstrip("#")
+    except Exception:
+        return None
+
+
+def clients():
+    out = subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True).stdout
+    return json.loads(out or "[]")
+
+
+def paint(c):
+    box = box_of(c["pid"])
+    col = box and color_of(box)
+    if not col:
+        return
+    for prop, val in (("activebordercolor", f"rgb({col})"),
+                      ("inactivebordercolor", f"rgba({col}88)"),
+                      ("bordersize", BORDER)):
+        setprop(c["address"], prop, val)
+
+
+def setprop(addr, prop, val):
+    # newer Hyprland has `hyprctl setprop`, older ones only the `dispatch setprop` form
+    for form in (["hyprctl", "setprop"], ["hyprctl", "dispatch", "setprop"]):
+        r = subprocess.run([*form, f"address:{addr}", prop, val, "lock"], capture_output=True, text=True)
+        if r.stdout.strip() == "ok":
+            return
+    print(f"mq-borders: setprop {prop} failed: {r.stdout.strip() or r.stderr.strip()}", flush=True)
+
+
+def paint_all():
+    for c in clients():
+        paint(c)
+
+
+def main():
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if not sig:
+        raise SystemExit("mq-borders: not running under Hyprland")
+    path = f"{os.environ['XDG_RUNTIME_DIR']}/hypr/{sig}/.socket2.sock"
+    paint_all()
+    with socket.socket(socket.AF_UNIX) as s:
+        s.connect(path)
+        buf = b""
+        while True:
+            data = s.recv(4096)
+            if not data:
+                break
+            buf += data
+            *lines, buf = buf.split(b"\n")
+            for line in lines:
+                if line.startswith(b"openwindow>>") or line.startswith(b"movewindow>>"):
+                    paint_all()
+
+
+if __name__ == "__main__":
+    main()

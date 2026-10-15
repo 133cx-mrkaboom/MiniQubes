@@ -1,0 +1,665 @@
+#!/usr/bin/env python3
+"""
+miniqubes - sandboxed app boxes (templates, presets, create/list/run/delete)
+
+Install:   sudo install -m755 miniqubes /usr/local/bin/      (needs: python 3.11+, bubblewrap)
+Quick start with your existing Alpine rootfs:
+    miniqubes template import alpine ~/microvm/alpine-root   # asks for sudo
+    miniqubes create school --preset alpine
+    miniqubes run school -- firefox
+
+Model:
+  template = a read-only root filesystem shared by boxes (root-owned, /var/lib/miniqubes/templates)
+  box      = your config (~/.config/miniqubes/boxes/NAME.toml) + its home dir (~/.local/share/miniqubes/boxes/NAME)
+  Admin happens from outside: `miniqubes template install/update` run the package manager inside the
+  template as root, from the host. Nothing inside a box ever has admin.
+"""
+import argparse
+import json
+import os
+import platform
+import re
+import shlex
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import tomllib
+import urllib.request
+from pathlib import Path
+
+TEMPLATES = Path(os.environ.get("MQ_TEMPLATES", "/var/lib/miniqubes/templates"))
+CONF = Path(os.environ.get("MQ_CONF", Path.home() / ".config/miniqubes/boxes"))
+DATA = Path(os.environ.get("MQ_DATA", Path.home() / ".local/share/miniqubes/boxes"))
+
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+CHROOT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# ---------------------------------------------------------------- seccomp
+# Syscall filter for boxed apps, applied by bwrap --seccomp. x86_64 only. The arch check kills
+# the process on any other ABI, so an i386/x32 syscall can't dodge the list.
+SYSCALLS = {  # name -> x86_64 syscall number
+    "acct": 163, "add_key": 248, "adjtimex": 159, "bpf": 321, "chroot": 161,
+    "clock_adjtime": 305, "clock_settime": 227, "delete_module": 176, "finit_module": 313,
+    "fsconfig": 431, "fsmount": 432, "fsopen": 430, "fspick": 433, "init_module": 175,
+    "io_uring_enter": 426, "io_uring_register": 427, "io_uring_setup": 425,
+    "kexec_file_load": 320, "kexec_load": 246, "keyctl": 250, "mount": 165,
+    "mount_setattr": 442, "move_mount": 429, "name_to_handle_at": 303, "nfsservctl": 180,
+    "open_by_handle_at": 304, "open_tree": 428, "perf_event_open": 298, "personality": 135,
+    "pivot_root": 155, "ptrace": 101, "process_vm_readv": 310, "process_vm_writev": 311,
+    "quotactl": 179, "reboot": 169, "request_key": 249, "setns": 308, "settimeofday": 164,
+    "swapoff": 168, "swapon": 167, "syslog": 103, "umount2": 166, "unshare": 272,
+    "uselib": 134, "userfaultfd": 323, "vhangup": 153,
+}
+LOW = ["io_uring_setup", "io_uring_enter", "io_uring_register", "userfaultfd", "bpf",
+       "perf_event_open", "kexec_load", "kexec_file_load", "init_module", "finit_module",
+       "delete_module", "reboot", "swapon", "swapoff", "syslog", "acct"]
+STANDARD = LOW + ["keyctl", "add_key", "request_key", "mount", "umount2", "pivot_root",
+                  "move_mount", "open_tree", "fsopen", "fsconfig", "fsmount", "fspick",
+                  "mount_setattr", "open_by_handle_at", "name_to_handle_at",
+                  "process_vm_readv", "process_vm_writev", "ptrace",
+                  "settimeofday", "clock_settime", "clock_adjtime", "adjtimex"]
+STRICT = STANDARD + ["unshare", "setns", "personality", "chroot", "quotactl", "uselib",
+                     "vhangup", "nfsservctl"]
+# level -> (denied syscall names, also block namespace creation via clone/clone3)
+SECCOMP_LEVELS = {
+    "none": ([], False),
+    "low": (LOW, False),
+    "standard": (STANDARD, False),
+    "strict": (STRICT, True),
+    "custom": ([], False),  # custom uses the box's seccomp_deny list instead
+}
+CLONE_NS_FLAGS = 0x7E020000  # NEWNS|NEWCGROUP|NEWUTS|NEWIPC|NEWUSER|NEWPID|NEWNET
+
+
+def build_seccomp(deny, block_ns):
+    """Classic BPF program: default allow, EPERM for denied syscalls, optional namespace block."""
+    ld_abs, jeq, jset, ret = 0x20, 0x15, 0x45, 0x06
+    prog = [
+        (ld_abs, None, None, 4),                        # arch
+        (jeq, "ok", None, 0xC000003E),                  # AUDIT_ARCH_X86_64
+        (ret, None, None, 0x80000000),                  # wrong arch: KILL_PROCESS
+        "ok",
+        (ld_abs, None, None, 0),                        # syscall number
+    ]
+    prog += [(jeq, "deny", None, SYSCALLS[n]) for n in deny]
+    if block_ns:
+        prog += [(jeq, "enosys", None, 435),            # clone3 packs flags in user memory,
+                 (jeq, "clone", "allow", 56)]           # so force glibc back to clone
+        prog += ["clone", (ld_abs, None, None, 16),     # clone flags = args[0] low 32 bits
+                 (jset, "deny", "allow", CLONE_NS_FLAGS)]
+    prog += ["allow", (ret, None, None, 0x7FFF0000),    # SECCOMP_RET_ALLOW
+             "deny", (ret, None, None, 0x00050001),     # SECCOMP_RET_ERRNO(EPERM)
+             "enosys", (ret, None, None, 0x00050026)]   # SECCOMP_RET_ERRNO(ENOSYS)
+
+    labels, n = {}, 0
+    for ins in prog:
+        if isinstance(ins, str):
+            labels[ins] = n
+        else:
+            n += 1
+    out, n = b"", 0
+    for ins in prog:
+        if isinstance(ins, str):
+            continue
+        code, jt, jf, k = ins
+        off = lambda lbl: 0 if lbl is None else labels[lbl] - n - 1
+        out += struct.pack("<HBBI", code, off(jt), off(jf), k)
+        n += 1
+    return out
+
+
+def seccomp_fd(deny, block_ns):
+    """Memfd holding the BPF program, inheritable so bwrap --seccomp FD can read it."""
+    fd = os.memfd_create("mq-seccomp")
+    os.write(fd, build_seccomp(deny, block_ns))
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.set_inheritable(fd, True)
+    return fd
+
+
+def check_seccomp(level, deny):
+    if level not in SECCOMP_LEVELS:
+        die(f"seccomp must be one of: {' | '.join(SECCOMP_LEVELS)}")
+    bad = [s for s in deny if s not in SYSCALLS]
+    if bad:
+        die("unknown syscall(s): " + ", ".join(bad))
+
+
+# ---------------------------------------------------------------- presets
+
+PRESETS = {
+    "alpine": dict(template="alpine", tier="trusted", network="direct", color="#2e7d32",
+                   persistent=True, apps=["firefox"], seccomp="standard",
+                   about="everyday trusted box on Alpine (small, fast)"),
+    "arch": dict(template="arch", tier="trusted", network="direct", color="#1565c0",
+                 persistent=True, apps=["firefox"], seccomp="standard",
+                 about="everyday trusted box on Arch (needs an arch template)"),
+    "disposable": dict(template="alpine", tier="disposable", network="direct", color="#c62828",
+                       persistent=False, apps=["firefox"], seccomp="standard",
+                       about="throwaway: home lives in RAM, gone when you close it"),
+    "custom": dict(template="alpine", tier="trusted", network="none", color="#555555",
+                   persistent=True, apps=[], seccomp="standard",
+                   about="blank box, no network, you choose everything"),
+}
+
+
+def die(msg):
+    print(f"miniqubes: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------- boxes
+
+def toml_list(items):
+    return "[" + ", ".join(json.dumps(i) for i in items) + "]"
+
+
+def write_box(name, box):
+    CONF.mkdir(parents=True, exist_ok=True)
+    lines = [f"name = {json.dumps(name)}"]
+    for k in ("template", "tier", "color", "network"):
+        lines.append(f"{k} = {json.dumps(box[k])}")
+    lines.append(f"persistent = {'true' if box['persistent'] else 'false'}")
+    lines.append(f"seccomp = {json.dumps(box.get('seccomp', 'none'))}")
+    if box.get("seccomp") == "custom":
+        lines.append(f"seccomp_deny = {toml_list(box.get('seccomp_deny', []))}")
+    if "frame" in box:
+        lines.append(f"frame = {'true' if box['frame'] else 'false'}")
+    for k in ("sound", "camera"):
+        lines.append(f"{k} = {'true' if box.get(k) else 'false'}")
+    lines.append(f"shares = {toml_list(box['shares'])}")
+    lines.append(f"apps = {toml_list(box['apps'])}")
+    (CONF / f"{name}.toml").write_text("\n".join(lines) + "\n")
+
+
+def load_box(name):
+    p = CONF / f"{name}.toml"
+    if not p.exists():
+        die(f"no box '{name}' (see: miniqubes list)")
+    with open(p, "rb") as f:
+        return tomllib.load(f)
+
+
+def check_network(n):
+    if n in ("none", "direct", "internet"):
+        return
+    die("network must be: none | direct | internet")
+
+
+def normalize_share(s):
+    mode = "ro"
+    if s.endswith(":rw") or s.endswith(":ro"):
+        s, mode = s[:-3], s[-2:]
+    p = Path(s).expanduser().resolve()
+    if not p.exists():
+        die(f"share path does not exist: {p}")
+    return f"{p}:{mode}"
+
+
+def swatch(color):
+    if not sys.stdout.isatty():
+        return ""
+    r, g, b = (int(color[i:i + 2], 16) for i in (1, 3, 5))
+    return f"\x1b[48;2;{r};{g};{b}m  \x1b[0m "
+
+
+def cmd_presets(a):
+    for n, p in PRESETS.items():
+        print(f"{swatch(p['color'])}{n:<11} {p['network']:<7} {p['about']}")
+
+
+def cmd_list(a):
+    if not CONF.is_dir() or not list(CONF.glob("*.toml")):
+        print("no boxes yet. try: miniqubes create mybox --preset alpine")
+        return
+    print(f"{'BOX':<16}{'TEMPLATE':<10}{'TIER':<12}{'NETWORK':<10}")
+    for p in sorted(CONF.glob("*.toml")):
+        with open(p, "rb") as f:
+            b = tomllib.load(f)
+        print(f"{swatch(b['color'])}{b['name']:<14}{b['template']:<10}{b['tier']:<12}{b['network']:<10}")
+
+
+def cmd_show(a):
+    load_box(a.name)
+    print((CONF / f"{a.name}.toml").read_text(), end="")
+
+
+def cmd_create(a):
+    if not NAME_RE.match(a.name):
+        die("box name: lowercase letters, digits, - and _ (max 32)")
+    if (CONF / f"{a.name}.toml").exists():
+        die(f"box '{a.name}' already exists")
+    box = {k: v for k, v in PRESETS[a.preset].items() if k != "about"}
+    if a.template:
+        box["template"] = a.template
+    if a.network:
+        box["network"] = a.network
+    if a.color:
+        if not COLOR_RE.match(a.color):
+            die("color must look like #rrggbb")
+        box["color"] = a.color
+    if a.disposable:
+        box["persistent"] = False
+        box["tier"] = "disposable"
+    box["frame"] = not a.no_frame
+    box["shares"] = [normalize_share(s) for s in a.share]
+    for k in ("sound", "camera"):
+        box[k] = bool(getattr(a, k))
+    if a.seccomp:
+        box["seccomp"] = a.seccomp
+    if a.deny_syscall and box["seccomp"] != "custom":
+        die("--deny-syscall only applies with --seccomp custom")
+    box["seccomp_deny"] = a.deny_syscall
+    check_seccomp(box["seccomp"], box["seccomp_deny"])
+    check_network(box["network"])
+    write_box(a.name, box)
+    print(f"created box '{a.name}' ({a.preset}, network={box['network']})")
+    if not (TEMPLATES / box["template"]).is_dir():
+        print(f"note: template '{box['template']}' isn't installed yet. "
+              f"run: miniqubes template build {box['template']}   (or template import)")
+
+
+def cmd_delete(a):
+    load_box(a.name)
+    if not a.yes:
+        if input(f"delete box '{a.name}' and ALL its data? type the name to confirm: ") != a.name:
+            die("cancelled")
+    (CONF / f"{a.name}.toml").unlink()
+    shutil.rmtree(DATA / a.name, ignore_errors=True)
+    print(f"deleted '{a.name}'")
+
+
+def write_theme(name, box):
+    """Per-box Firefox theme (colored banner + toolbar line), mounted read-only so the app can't change it."""
+    th = DATA / name / "theme"
+    (th / "chrome").mkdir(parents=True, exist_ok=True)
+    col = box["color"]
+    r, g, b = (int(col[i:i + 2], 16) for i in (1, 3, 5))
+    fg = "#000000" if (r * 299 + g * 587 + b * 114) / 1000 > 150 else "#ffffff"
+    prefs = ('user_pref("toolkit.legacyUserProfileCustomizations.stylesheets", true);\n'
+             'user_pref("browser.sessionstore.resume_from_crash", false);\n'
+             'user_pref("browser.shell.checkDefaultBrowser", false);\n')
+    (th / "user.js").write_text(prefs)
+    (th / "chrome" / "userChrome.css").write_text(
+        f"#navigator-toolbox::before {{ content: \"\\25CF  {name}  ({box['tier']})\"; display: block;"
+        f" background: {col}; color: {fg}; font: bold 13px sans-serif; padding: 3px 10px; }}\n"
+        f"#navigator-toolbox {{ border-bottom: 3px solid {col} !important; }}\n"
+        f"#TabsToolbar, #nav-bar {{ background-color: {col}40 !important; }}\n")
+    return th
+
+
+def write_frame(name, box):
+    """Theme for the box's nested labwc: every window inside gets the box's colored title bar + border."""
+    th = DATA / name / "frame"
+    (th / "config").mkdir(parents=True, exist_ok=True)
+    (th / "themes/mq/labwc").mkdir(parents=True, exist_ok=True)
+    col = box["color"]
+    r, g, b = (int(col[i:i + 2], 16) for i in (1, 3, 5))
+    fg = "#000000" if (r * 299 + g * 587 + b * 114) / 1000 > 150 else "#ffffff"
+    dim = "#%02x%02x%02x" % (r * 6 // 10, g * 6 // 10, b * 6 // 10)
+    (th / "config/rc.xml").write_text(
+        '<?xml version="1.0"?>\n<labwc_config>\n'
+        '  <theme><name>mq</name><cornerRadius>0</cornerRadius></theme>\n'
+        '  <titlebar><layout>icon:close</layout></titlebar>\n'
+        '  <windowRules>\n'
+        '    <windowRule identifier="*"><action name="Maximize"/></windowRule>\n'
+        '  </windowRules>\n'
+        # kiosk: no default keybinds (no alt-tab, move, resize, unmaximize); no default mouse binds
+        # (no titlebar double-click, no drag-to-move/resize). Only: click focuses, close button closes.
+        '  <keyboard></keyboard>\n'
+        '  <mouse>\n'
+        '    <context name="Client"><mousebind button="Left" action="Press">'
+        '<action name="Focus"/><action name="Raise"/></mousebind></context>\n'
+        '    <context name="Close"><mousebind button="Left" action="Release">'
+        '<action name="Close"/></mousebind></context>\n'
+        '  </mouse>\n'
+        '</labwc_config>\n')
+    (th / "themes/mq/labwc/themerc").write_text(
+        "border.width: 4\npadding.height: 4\nwindow.label.text.justify: center\n"
+        f"window.active.border.color: {col}\nwindow.inactive.border.color: {dim}\n"
+        f"window.active.title.bg.color: {col}\nwindow.inactive.title.bg.color: {dim}\n"
+        f"window.active.label.text.color: {fg}\nwindow.inactive.label.text.color: {fg}\n"
+        f"window.active.button.unpressed.image.color: {fg}\nwindow.inactive.button.unpressed.image.color: {fg}\n")
+    return th
+
+
+def cmd_run(a):
+    box = load_box(a.name)
+    check_network(box["network"])
+
+    tpl = TEMPLATES / box["template"]
+    if not tpl.is_dir():
+        die(f"template '{box['template']}' not installed (miniqubes template build {box['template']})")
+    if not shutil.which("bwrap"):
+        die("bubblewrap is not installed")
+    pre = subprocess.run(["bwrap", "--unshare-user", "--ro-bind", "/", "/", "true"], capture_output=True)
+    if pre.returncode != 0:
+        die("bwrap can't create a user namespace here: " + pre.stderr.decode().strip() +
+            "\n(hardened systems like Kicksecure may disable this; a root-launch mode is planned)")
+
+    cmd = [c for c in a.command if c != "--"] if a.command and a.command[0] == "--" else a.command
+    if not cmd:
+        cmd = shlex.split(box["apps"][0]) if box["apps"] else []
+    if not cmd:
+        die("this box has no default app. pass a command: miniqubes run NAME -- firefox")
+
+    args = ["--unshare-all", "--die-with-parent", "--new-session", "--cap-drop", "ALL",
+            "--uid", "1000", "--gid", "1000", "--hostname", a.name,
+            "--ro-bind", str(tpl), "/",
+            "--proc", "/proc", "--dev", "/dev"]
+    if Path("/dev/dri").exists():
+        args += ["--dev-bind", "/dev/dri", "/dev/dri"]
+    args += ["--ro-bind", "/sys", "/sys",
+             "--tmpfs", "/tmp", "--tmpfs", "/run", "--tmpfs", "/home",
+             "--perms", "0700", "--dir", "/run/user/1000",
+             "--clearenv",
+             "--setenv", "PATH", "/usr/local/bin:/usr/bin:/bin",
+             "--setenv", "HOME", "/home/user",
+             "--setenv", "XDG_RUNTIME_DIR", "/run/user/1000",
+             "--setenv", "LANG", "C.UTF-8",
+             "--setenv", "MQ_BOX", a.name]
+
+    rt, wl = os.environ.get("XDG_RUNTIME_DIR"), os.environ.get("WAYLAND_DISPLAY")
+    if not rt or not wl:
+        die("needs a running Wayland session (XDG_RUNTIME_DIR / WAYLAND_DISPLAY not set)")
+    sock = Path(rt) / wl
+    if not sock.exists():
+        die(f"wayland socket not found: {sock}")
+    args += ["--ro-bind", str(sock), "/run/user/1000/mq-host",
+             "--setenv", "WAYLAND_DISPLAY", "mq-host",
+             "--setenv", "MOZ_ENABLE_WAYLAND", "1"]
+    # Off unless enabled per qube. The Pulse/PipeWire socket carries playback AND microphone capture,
+    # so there is no sound-without-mic at the socket level: "sound" includes the microphone.
+    if box.get("sound"):
+        pw, pulse = Path(rt) / "pipewire-0", Path(rt) / "pulse/native"
+        if pw.exists():
+            args += ["--bind", str(pw), "/run/user/1000/pipewire-0"]
+        if pulse.exists():
+            args += ["--bind", str(pulse), "/run/user/1000/pulse/native",
+                     "--setenv", "PULSE_SERVER", "unix:/run/user/1000/pulse/native"]
+    if box.get("camera"):
+        for dev in sorted(Path("/dev").glob("video[0-9]*")):
+            args += ["--dev-bind", str(dev), str(dev)]
+
+    if box["persistent"]:
+        home = DATA / a.name / "home"
+        home.mkdir(parents=True, exist_ok=True)
+        home.chmod(0o700)
+        args += ["--bind", str(home), "/home/user"]
+    else:
+        args += ["--tmpfs", "/home/user"]
+
+    used = set()
+    for s in box.get("shares", []):
+        path, mode = s.rsplit(":", 1)
+        flag = "--bind" if mode == "rw" else "--ro-bind"
+        name, n = Path(path).name, 2
+        base = name
+        while name in used:
+            name, n = f"{base}-{n}", n + 1
+        used.add(name)
+        args += [flag, path, f"/home/user/Shared/{name}"]
+
+    if box["network"] == "direct":
+        args += ["--share-net", "--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf"]
+    # "none" boxes get no network namespace at all.
+
+
+    if Path(cmd[0]).name == "firefox":
+        th = write_theme(a.name, box)
+        args += ["--ro-bind", str(th / "user.js"), "/home/user/.mq-ff/user.js",
+                 "--ro-bind", str(th / "chrome"), "/home/user/.mq-ff/chrome"]
+        cmd = [cmd[0], "-profile", "/home/user/.mq-ff", "--no-remote", *cmd[1:]]
+
+    have_labwc = (tpl / "usr/bin/labwc").exists()
+    want_frame = True if a.frame else (False if a.no_frame else box.get("frame"))
+    if want_frame is None:   # old box with no setting: the colored frame is the default
+        want_frame = have_labwc
+        if not have_labwc:
+            print(f"miniqubes: warning: no labwc in template '{box['template']}', so no colored frame: "
+                  f"this app can see the whole desktop. fix: miniqubes template install {box['template']} labwc",
+                  file=sys.stderr)
+    if want_frame:
+        if not have_labwc:
+            die(f"frame mode needs labwc in the template: miniqubes template install {box['template']} labwc")
+        th = write_frame(a.name, box)
+        args += ["--ro-bind", str(th / "config"), "/home/user/.config/labwc",
+                 "--ro-bind", str(th / "themes"), "/home/user/.local/share/themes"]
+        cmd = ["labwc", "-S", shlex.join(cmd)]
+
+    level = box.get("seccomp", "none")
+    check_seccomp(level, box.get("seccomp_deny", []))
+    if level != "none":
+        if platform.machine() != "x86_64":
+            die(f"seccomp filters are x86_64-only (this machine is {platform.machine()})")
+        deny = box.get("seccomp_deny", []) if level == "custom" else SECCOMP_LEVELS[level][0]
+        args += ["--seccomp", str(seccomp_fd(deny, SECCOMP_LEVELS[level][1]))]
+    # mq:internet
+    net = box["network"]
+    wrap = None
+    if net == "internet":
+        # own network namespace via pasta (user-mode networking) + a firewall that blocks the local network.
+        # fails closed: if anything is missing, nothing runs.
+        pasta = shutil.which("pasta")
+        nft = shutil.which("nft", path=os.environ.get("PATH", "") + ":/usr/sbin:/sbin")
+        if not pasta or not nft:
+            die("network 'internet' needs pasta (package: passt) and nft (package: nftables); refusing to run without them")
+        if "--unshare-all" in args:
+            args.remove("--unshare-all")
+        args = ["--unshare-user", "--unshare-ipc", "--unshare-pid", "--unshare-uts", "--unshare-cgroup-try"] + args
+        (DATA / a.name).mkdir(parents=True, exist_ok=True)
+        resolv = DATA / a.name / "resolv.conf"
+        resolv.write_text("nameserver 10.255.255.53\n")
+        rules = Path(rt) / f"mq-net-{a.name}.nft"
+        rules.write_text(
+            "add table inet mq\n"
+            "add chain inet mq out { type filter hook output priority 0; policy accept; }\n"
+            'add rule inet mq out oifname "lo" accept\n'
+            "add rule inet mq out ip daddr 10.255.255.53 accept\n"
+            "add rule inet mq out ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, "
+            "224.0.0.0/4, 255.255.255.255 } drop\n")
+        rules.chmod(0o644)
+        args += ["--ro-bind", str(resolv), "/etc/resolv.conf"]
+        script = ('"$1" -f "$2" || { echo "miniqubes: couldn\'t set up the LAN firewall, refusing to run" >&2; exit 97; }; '
+                  'shift 2; exec "$@"')
+        wrap = [pasta, "-4", "--config-net", "--no-map-gw", "-t", "none", "-T", "none", "-u", "none", "-U", "none",
+                "--dns-forward", "10.255.255.53", "--", "sh", "-c", script, "sh", nft, str(rules)]
+    if wrap:
+        os.execvp(wrap[0], [*wrap, "bwrap", *args, *cmd])
+    os.execvp("bwrap", ["bwrap", *args, *cmd])
+
+
+# ---------------------------------------------------------------- templates (root, admin from outside)
+
+def need_root():
+    if os.geteuid() != 0:
+        os.execvp("sudo", ["sudo", sys.executable, os.path.abspath(sys.argv[0]), *sys.argv[1:]])
+
+
+def with_chroot(root, script, check=True):
+    """Run a shell script as root inside a template (proc + dev mounted, working DNS)."""
+    root = str(root)
+    resolv = root + "/etc/resolv.conf"
+    ns = "nameserver 1.1.1.1\n"
+    for cand in ("/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"):
+        if os.path.exists(cand):
+            text = Path(cand).read_text()
+            if "nameserver" in text and "127.0.0." not in text:
+                ns = text
+                break
+    if os.path.lexists(resolv):
+        os.remove(resolv)
+    Path(resolv).write_text(ns)
+
+    chroot = shutil.which("chroot")
+    subprocess.run(["mount", "--bind", root, root], check=True)
+    try:
+        subprocess.run(["mount", "-t", "proc", "proc", root + "/proc"], check=True)
+        subprocess.run(["mount", "--bind", "/dev", root + "/dev"], check=True)
+        subprocess.run([chroot, root, "/bin/sh", "-ec", script], check=check,
+                       env={"PATH": CHROOT_PATH, "TERM": os.environ.get("TERM", "xterm")})
+    finally:
+        subprocess.run(["umount", "-R", root], check=False)
+
+
+def pkg_manager(root):
+    if (root / "sbin/apk").exists():
+        return "apk"
+    if (root / "usr/bin/pacman").exists():
+        return "pacman"
+    die(f"can't tell which package manager {root.name} uses (supported: apk, pacman)")
+
+
+def build_alpine(dest):
+    base = "https://dl-cdn.alpinelinux.org/alpine/latest-stable"
+    idx = urllib.request.urlopen(f"{base}/releases/x86_64/latest-releases.yaml", timeout=30).read().decode()
+    m = re.search(r"alpine-minirootfs-[0-9.]+-x86_64\.tar\.gz", idx)
+    if not m:
+        die("couldn't find the Alpine minirootfs name")
+    dest.mkdir(parents=True)
+    with tempfile.TemporaryDirectory() as td:
+        tar = Path(td) / m.group(0)
+        print(f"downloading {m.group(0)} ...")
+        urllib.request.urlretrieve(f"{base}/releases/x86_64/{m.group(0)}", tar)
+        subprocess.run(["tar", "-xzf", str(tar), "-C", str(dest)], check=True)
+    (dest / "etc/apk/repositories").write_text(f"{base}/main\n{base}/community\n")
+    with_chroot(dest, "apk update && apk add firefox mesa-dri-gallium mesa-egl font-dejavu ca-certificates libpulse "
+                      "&& adduser -D -s /bin/ash -u 1000 user")
+
+
+def build_arch(dest):
+    if not shutil.which("pacstrap"):
+        die("building the arch template needs an Arch host with arch-install-scripts.\n"
+            "on other distros build it elsewhere and use: miniqubes template import arch <dir>")
+    dest.mkdir(parents=True)
+    subprocess.run(["pacstrap", "-K", str(dest), "base", "firefox", "mesa", "ttf-dejavu"], check=True)
+    with_chroot(dest, "useradd -m -u 1000 -s /bin/bash user")
+
+
+def cmd_tlist(a):
+    if not TEMPLATES.is_dir() or not any(TEMPLATES.iterdir()):
+        print("no templates. try: miniqubes template build alpine")
+        return
+    for p in sorted(TEMPLATES.iterdir()):
+        if p.is_dir():
+            print(f"{p.name:<12}{pkg_manager(p)}")
+
+
+def cmd_tbuild(a):
+    need_root()
+    dest = TEMPLATES / a.name
+    if dest.exists():
+        die(f"template '{a.name}' already exists (delete {dest} to rebuild)")
+    TEMPLATES.mkdir(parents=True, exist_ok=True)
+    try:
+        {"alpine": build_alpine, "arch": build_arch}[a.name](dest)
+    except BaseException:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
+    print(f"template '{a.name}' ready")
+
+
+def cmd_timport(a):
+    need_root()
+    src, dest = Path(a.dir).resolve(), TEMPLATES / a.name
+    if not (src / "etc").is_dir():
+        die(f"{src} doesn't look like a root filesystem")
+    if dest.exists():
+        die(f"template '{a.name}' already exists")
+    TEMPLATES.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["cp", "-a", str(src), str(dest)], check=True)
+    subprocess.run(["chown", "-R", "root:root", str(dest)], check=True)
+    print(f"imported as template '{a.name}'")
+
+
+def cmd_tinstall(a):
+    need_root()
+    root = TEMPLATES / a.name
+    if not root.is_dir():
+        die(f"no template '{a.name}'")
+    pk = shlex.join(a.packages)
+    with_chroot(root, f"apk add {pk}" if pkg_manager(root) == "apk" else f"pacman -S --noconfirm --needed {pk}")
+
+
+def cmd_tshell(a):
+    need_root()
+    root = TEMPLATES / a.name
+    if not root.is_dir():
+        die(f"no template '{a.name}'")
+    with_chroot(root, f"cd /root 2>/dev/null || cd /; echo 'root shell in template {a.name} (every box using it "
+                      f"sees your changes). type exit to leave.'; exec /bin/sh -l", check=False)
+
+
+def cmd_tupdate(a):
+    need_root()
+    root = TEMPLATES / a.name
+    if not root.is_dir():
+        die(f"no template '{a.name}'")
+    with_chroot(root, "apk update && apk upgrade" if pkg_manager(root) == "apk" else "pacman -Syu --noconfirm")
+
+
+# ---------------------------------------------------------------- cli
+
+def main():
+    ap = argparse.ArgumentParser(prog="miniqubes", description="sandboxed app boxes")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("presets", help="list box presets").set_defaults(fn=cmd_presets)
+    sub.add_parser("list", help="list your boxes").set_defaults(fn=cmd_list)
+
+    s = sub.add_parser("create", help="create a box")
+    s.add_argument("name")
+    s.add_argument("--preset", choices=list(PRESETS), default="alpine")
+    s.add_argument("--template")
+    s.add_argument("--network", help="none | direct | internet (no local network)")
+    s.add_argument("--color", help="#rrggbb")
+    s.add_argument("--disposable", action="store_true", help="home in RAM, wiped on exit")
+    s.add_argument("--frame", action="store_true",
+                   help="run the box inside its own colored window frame (works on any desktop, all apps)")
+    s.add_argument("--no-frame", action="store_true",
+                   help="don't use the colored frame (apps can then see the whole desktop; not recommended)")
+    s.add_argument("--sound", action="store_true",
+                   help="allow audio playback AND the microphone (one socket; off by default)")
+    s.add_argument("--camera", action="store_true", help="allow webcam access (off by default)")
+    s.add_argument("--share", action="append", default=[], metavar="PATH[:ro|:rw]",
+                   help="folder to share into the box (default read-only)")
+    s.add_argument("--seccomp", choices=list(SECCOMP_LEVELS),
+                   help="syscall filter: none | low | standard | strict | custom (default: preset)")
+    s.add_argument("--deny-syscall", action="append", default=[], dest="deny_syscall", metavar="NAME",
+                   help="with --seccomp custom: make this syscall fail with EPERM (repeatable)")
+    s.set_defaults(fn=cmd_create)
+
+    s = sub.add_parser("show", help="print a box's config")
+    s.add_argument("name")
+    s.set_defaults(fn=cmd_show)
+
+    s = sub.add_parser("run", help="run an app in a box")
+    s.add_argument("--frame", action="store_true", help="force the colored frame for this run")
+    s.add_argument("--no-frame", action="store_true", help="skip the colored frame for this run")
+    s.add_argument("name")
+    s.add_argument("command", nargs=argparse.REMAINDER)
+    s.set_defaults(fn=cmd_run)
+
+    s = sub.add_parser("delete", help="delete a box and its data")
+    s.add_argument("name")
+    s.add_argument("--yes", action="store_true")
+    s.set_defaults(fn=cmd_delete)
+
+    t = sub.add_parser("template", help="manage templates (admin, uses sudo)")
+    ts = t.add_subparsers(dest="tcmd", required=True)
+    ts.add_parser("list").set_defaults(fn=cmd_tlist)
+    s = ts.add_parser("build"); s.add_argument("name", choices=["alpine", "arch"]); s.set_defaults(fn=cmd_tbuild)
+    s = ts.add_parser("import"); s.add_argument("name"); s.add_argument("dir"); s.set_defaults(fn=cmd_timport)
+    s = ts.add_parser("install"); s.add_argument("name"); s.add_argument("packages", nargs="+"); s.set_defaults(fn=cmd_tinstall)
+    s = ts.add_parser("update"); s.add_argument("name"); s.set_defaults(fn=cmd_tupdate)
+    s = ts.add_parser("shell"); s.add_argument("name"); s.set_defaults(fn=cmd_tshell)
+
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

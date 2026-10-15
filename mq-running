@@ -1,0 +1,44 @@
+#!/usr/bin/python3
+"""mq-running - tiny status for the bar: which qubes have apps running right now (waybar JSON)."""
+import json
+import os
+import tomllib
+from pathlib import Path
+
+CONF = Path(os.environ.get("MQ_CONF", Path.home() / ".config/miniqubes/boxes"))
+
+
+def running():
+    names = {}
+    for d in os.scandir("/proc"):
+        if not d.name.isdigit():
+            continue
+        try:
+            if Path(d.path, "comm").read_text().strip() != "bwrap":
+                continue
+            argv = Path(d.path, "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        for i, a in enumerate(argv[:-2]):
+            if a == b"--setenv" and argv[i + 1] == b"MQ_BOX":
+                names[argv[i + 2].decode()] = names.get(argv[i + 2].decode(), 0) + 1
+    return names
+
+
+def color(box):
+    try:
+        return tomllib.loads((CONF / f"{box}.toml").read_text())["color"]
+    except Exception:
+        return "#888888"
+
+
+names = running()
+if not names:
+    out = {"text": "", "class": "idle", "tooltip": "no qubes running"}
+else:
+    if len(names) <= 2:
+        text = "  ".join(f"<span color='{color(n)}'>●</span> {n}" for n in sorted(names))
+    else:
+        text = " ".join(f"<span color='{color(n)}'>●</span>" for n in sorted(names))
+    out = {"text": text, "class": "active", "tooltip": "running: " + ", ".join(sorted(names))}
+print(json.dumps(out, ensure_ascii=False))

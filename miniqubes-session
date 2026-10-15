@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# miniqubes-session - start the MiniQubes desktop: a small labwc desktop with a bar where
+# everything you open goes through a qube.
+#
+#   miniqubes-session             start it (from a login screen / TTY, or inside another desktop as a test window)
+#   miniqubes-session --software  force software rendering (old PCs / no GPU driver)
+#   miniqubes-session --reset     restore the default desktop settings (your old ones are kept as desktop.bak-DATE)
+#   miniqubes-session --seed      just create ~/.config/miniqubes/desktop if it doesn't exist
+#   miniqubes-session --cleanup   stop leftover bars/helpers from old sessions (fixes "two waybars")
+#
+# Your settings live in ~/.config/miniqubes/desktop (rc.xml, waybar.json, waybar.css, autostart, wallpaper.png).
+
+set -eu
+SRC=/usr/local/share/miniqubes/desktop
+DST=${MQ_DESKTOP:-$HOME/.config/miniqubes/desktop}
+SOFT=0 RESET=0 SEED=0 CLEANUP=0
+for a in "$@"; do
+  case $a in
+    --software) SOFT=1 ;;
+    --reset) RESET=1 ;;
+    --seed) SEED=1 ;;
+    --cleanup) CLEANUP=1 ;;
+    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    *) echo "unknown option: $a" >&2; exit 1 ;;
+  esac
+done
+
+if (( CLEANUP )); then
+  u=$(id -u)
+  pkill -u "$u" -f "$DST/autostart" || true
+  pkill -u "$u" -f "mq-menu --daemon" || true
+  pkill -u "$u" -f "waybar -c $DST/waybar.json" || true
+  pkill -u "$u" -f "swaybg -[ci]" || true
+  echo "cleaned up leftovers from old MiniQubes sessions"
+  exit 0
+fi
+
+[ -d "$SRC" ] || { echo "miniqubes-session: $SRC is missing, run install.sh again" >&2; exit 1; }
+# (re)create the settings folder: on --reset, or when this MiniQubes ships a newer desktop version
+# (your old copy is always kept as desktop.bak-DATE)
+if [ -d "$DST" ] && { (( RESET )) || [ "$(cat "$DST/version" 2>/dev/null)" != "$(cat "$SRC/version" 2>/dev/null)" ]; }; then
+  mv "$DST" "$DST.bak-$(date +%Y%m%d-%H%M%S)"
+  echo "desktop settings refreshed; your old ones are in $DST.bak-*"
+fi
+mkdir -p "$DST"
+for f in "$SRC"/*; do   # only files that don't exist yet, so your edits survive
+  n=${f##*/}
+  [ -e "$DST/$n" ] || sed "s#@DESKTOP@#$DST#g" "$f" > "$DST/$n"
+done
+chmod +x "$DST/autostart"
+(( SEED )) && exit 0
+
+command -v labwc >/dev/null  || { echo "labwc is not installed (run install.sh)" >&2; exit 1; }
+command -v waybar >/dev/null || echo "warning: waybar is not installed, there will be no bar (run install.sh)" >&2
+
+export MQ_DESKTOP=$DST
+export WLR_RENDERER_ALLOW_SOFTWARE=1        # fall back to software rendering instead of failing
+if (( SOFT )); then export WLR_RENDERER=pixman WLR_NO_HARDWARE_CURSORS=1; fi
+echo $$ > "${XDG_RUNTIME_DIR:-/tmp}/miniqubes-session.pid"   # used by mq-logout as a fallback
+exec labwc -C "$DST"

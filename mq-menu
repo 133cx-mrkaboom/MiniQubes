@@ -1,0 +1,203 @@
+#!/usr/bin/python3
+"""mq-menu - builds the bar's "Launcher" dropdown: qube -> (hover) -> app.
+
+  mq-menu --once     write menu.xml + menu.json into the desktop folder
+  mq-menu --daemon [PID]   same, then keep watching: when qubes or installed apps change, rebuild and reload the bar
+                           (stops by itself when process PID, the desktop, is gone)
+"""
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+import tomllib
+from pathlib import Path
+from xml.sax.saxutils import escape
+
+CONF = Path(os.environ.get("MQ_CONF", Path.home() / ".config/miniqubes/boxes"))
+TEMPLATES = Path(os.environ.get("MQ_TEMPLATES", "/var/lib/miniqubes/templates"))
+DESK = Path(os.environ.get("MQ_DESKTOP", Path.home() / ".config/miniqubes/desktop"))
+APP_DIRS = ("usr/share/applications", "usr/local/share/applications")
+
+
+def load_boxes():
+    out = []
+    for p in sorted(CONF.glob("*.toml")):
+        try:
+            b = tomllib.loads(p.read_text())
+            b.setdefault("name", p.stem)
+            out.append(b)
+        except Exception:
+            pass
+    return out
+
+
+def has(t, rel):
+    return (TEMPLATES / t / rel).exists()
+
+
+def terminal_cmd(t):
+    for x in ("foot", "xterm"):
+        if has(t, f"usr/bin/{x}"):
+            return [x]
+    return None
+
+
+def codes(m):
+    return "%" if m.group(1) == "%" else ""
+
+
+def desktop_apps(t):
+    apps, term = [], terminal_cmd(t)
+    for d in APP_DIRS:
+        try:
+            files = sorted((TEMPLATES / t / d).glob("*.desktop"))
+        except OSError:
+            continue
+        for f in files:
+            try:
+                lines = f.read_text(errors="replace").splitlines()
+            except OSError:
+                continue
+            ent, inside = {}, False
+            for ln in lines:
+                ln = ln.strip()
+                if ln.startswith("["):
+                    inside = ln == "[Desktop Entry]"
+                elif inside and "=" in ln and not ln.startswith("#"):
+                    k, v = ln.split("=", 1)
+                    ent.setdefault(k.strip(), v.strip())
+            if ent.get("Type", "Application") != "Application" or "true" in (ent.get("NoDisplay", ""), ent.get("Hidden", "")):
+                continue
+            if not ent.get("Name") or not ent.get("Exec"):
+                continue
+            try:
+                argv = shlex.split(re.sub(r"%(.)", codes, ent["Exec"]))
+            except ValueError:
+                continue
+            if not argv:
+                continue
+            if ent.get("Terminal") == "true":
+                if not term:
+                    continue
+                argv = term + argv
+            apps.append((ent["Name"], argv))
+    return apps
+
+
+def apps_for(box):
+    t = box["template"]
+    items, seen = [], set()
+    for a in box.get("apps", []):
+        try:
+            argv = shlex.split(a)
+        except ValueError:
+            continue
+        items.append((f"{a}   (default)", argv))
+        seen.add(tuple(argv))
+    term = terminal_cmd(t)
+    if term:
+        items.append(("Terminal", term))
+        seen.add(tuple(term))
+    for label, argv in sorted(desktop_apps(t), key=lambda x: x[0].lower()):
+        if tuple(argv) not in seen:
+            seen.add(tuple(argv))
+            items.append((label, argv))
+    return items[:60]
+
+
+def item(iid, label, sensitive=True):
+    return (f'<object class="GtkMenuItem" id="{iid}"><property name="visible">True</property>'
+            f'<property name="sensitive">{sensitive}</property><property name="label">{escape(label)}</property></object>')
+
+
+def build():
+    boxes = load_boxes()
+    actions, rows = {}, []
+    for b in boxes:
+        n = b["name"]
+        frame = has(b["template"], "usr/bin/labwc")
+        sub = []
+        apps = apps_for(b)
+        for i, (label, argv) in enumerate(apps):
+            aid = f"a-{n}-{i}"
+            actions[aid] = shlex.join(["mq-run", *(["--frame"] if frame else []), n, "--", *argv])
+            sub.append(f"<child>{item(aid, label)}</child>")
+        if not sub:
+            sub.append(f"<child>{item(f'none-{n}', '(no apps found in this qube)', False)}</child>")
+        dot = escape(f'<span color="{b.get("color", "#888888")}">●</span>  {n}')
+        rows.append(
+            f'<child><object class="GtkMenuItem" id="q-{n}"><property name="visible">True</property>'
+            f'<child><object class="GtkLabel"><property name="visible">True</property><property name="use-markup">True</property>'
+            f'<property name="xalign">0</property><property name="label">{dot}</property></object></child>'
+            f'<child type="submenu"><object class="GtkMenu"><property name="visible">True</property>{"".join(sub)}</object></child>'
+            f'</object></child>')
+    if not boxes:
+        rows.append(f"<child>{item('none', 'no qubes yet', False)}</child>")
+    actions["m-search"] = "mq-launcher"
+    actions["m-manage"] = "miniqubes-gui"
+    sep = '<child><object class="GtkSeparatorMenuItem"><property name="visible">True</property></object></child>'
+    rows.append(sep)
+    rows.append(f"<child>{item('m-search', 'Search apps / run command…')}</child>")
+    rows.append(f"<child>{item('m-manage', 'Manage qubes…')}</child>")
+    rows.append(sep)
+    power = (("p-logout", "Log out", "mq-logout"), ("p-suspend", "Suspend", "systemctl suspend"),
+             ("p-reboot", "Restart", "systemctl reboot"), ("p-off", "Shut down", "systemctl poweroff"))
+    for pid, _, cmd in power:
+        actions[pid] = cmd
+    rows.append('<child><object class="GtkMenuItem" id="m-power"><property name="visible">True</property>'
+                '<property name="label">Power</property><child type="submenu"><object class="GtkMenu">'
+                '<property name="visible">True</property>'
+                + "".join(f"<child>{item(pid, label)}</child>" for pid, label, _ in power)
+                + '</object></child></object></child>')
+    xml = ('<?xml version="1.0" encoding="UTF-8"?>\n<interface>\n<object class="GtkMenu" id="menu">'
+           '<property name="visible">True</property>' + "\n".join(rows) + "</object>\n</interface>\n")
+    import json
+    js = json.dumps({"custom/launcher": {"menu-actions": actions}}, ensure_ascii=False, indent=1) + "\n"
+    DESK.mkdir(parents=True, exist_ok=True)
+    for name, text in (("menu.xml", xml), ("menu.json", js)):
+        tmp = DESK / (name + ".tmp")
+        tmp.write_text(text)
+        tmp.replace(DESK / name)
+
+
+def signature():
+    sig = []
+    for p in sorted(CONF.glob("*.toml")):
+        try:
+            sig.append((p.name, p.stat().st_mtime_ns))
+        except OSError:
+            pass
+    for t in sorted({b["template"] for b in load_boxes()}):
+        for d in APP_DIRS + ("usr/bin",):
+            try:
+                sig.append((t, d, (TEMPLATES / t / d).stat().st_mtime_ns))
+            except OSError:
+                pass
+    return sig
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else "--once"
+    build()
+    if mode != "--daemon":
+        return
+    parent = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else None
+    last = signature()
+    while True:
+        time.sleep(4)
+        if parent:
+            try:
+                os.kill(parent, 0)
+            except ProcessLookupError:
+                return
+        now = signature()
+        if now != last:
+            last = now
+            build()
+            subprocess.run(["pkill", "-USR2", "-x", "waybar"], check=False)   # waybar reloads its config + menu
+
+
+if __name__ == "__main__":
+    main()

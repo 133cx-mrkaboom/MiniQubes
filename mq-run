@@ -1,0 +1,18 @@
+#!/bin/sh
+# mq-run [--frame] BOX -- COMMAND...   start an app in a qube (used by the bar's Launcher menu).
+# A small shell stays alive as the parent of the sandbox (it dies with its parent), and if the
+# app fails straight away, a terminal pops up showing why.
+log=$(mktemp "${TMPDIR:-/tmp}/mq-run.XXXXXX") || exit 1
+trap 'rm -f "$log"' EXIT
+start=$(date +%s)
+miniqubes run "$@" 2>"$log"
+rc=$?
+if [ "$rc" -ne 0 ] && [ $(( $(date +%s) - start )) -lt 8 ] && [ -s "$log" ]; then
+  for t in foot xterm; do
+    if command -v "$t" >/dev/null 2>&1; then
+      "$t" -e sh -c 'cat "$1"; echo; printf "press Enter to close "; read x' sh "$log"
+      break
+    fi
+  done
+fi
+exit "$rc"

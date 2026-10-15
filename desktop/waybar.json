@@ -1,0 +1,95 @@
+{
+  "layer": "top",
+  "position": "top",
+  "height": 34,
+  "spacing": 2,
+  "include": ["@DESKTOP@/menu.json"],
+
+  "modules-left": ["custom/launcher", "custom/manage", "ext/workspaces", "wlr/taskbar"],
+  "modules-right": ["custom/running", "network", "pulseaudio", "custom/profile", "battery", "clock", "tray"],
+
+  "custom/launcher": {
+    "format": "◈  Launcher ▾",
+    "menu": "on-click",
+    "menu-file": "@DESKTOP@/menu.xml",
+    "tooltip": false
+  },
+  "custom/manage": {
+    "format": "Manage",
+    "tooltip-format": "Create / delete qubes, install apps, admin shell  (Super+M)",
+    "on-click": "miniqubes-gui"
+  },
+  "ext/workspaces": {
+    "format": "{name}",
+    "on-click": "activate",
+    "sort-by-number": true
+  },
+  "wlr/taskbar": {
+    "format": "{title}",
+    "max-length": 16,
+    "tooltip-format": "{title}",
+    "all-outputs": true,
+    "on-click": "minimize-raise",
+    "on-click-middle": "close",
+    "on-click-right": "maximize"
+  },
+  "custom/running": {
+    "exec": "mq-running",
+    "return-type": "json",
+    "interval": 4,
+    "hide-empty-text": true,
+    "on-click": "miniqubes-gui"
+  },
+  "network": {
+    "format-wifi": "Wi-Fi",
+    "format-ethernet": "Wired",
+    "format-disconnected": "No net",
+    "tooltip-format-wifi": "{essid}  {signalStrength}%   {ipaddr}   (click: Wi-Fi settings)",
+    "tooltip-format": "{ifname}  {ipaddr}   (click: Wi-Fi settings)",
+    "interval": 5,
+    "on-click": "mq-tui wifi"
+  },
+  "pulseaudio": {
+    "format": "Vol {volume}%",
+    "format-muted": "Muted",
+    "tooltip-format": "click: audio mixer   scroll: volume",
+    "scroll-step": 5,
+    "on-click": "mq-tui audio",
+    "on-click-right": "pactl set-sink-mute @DEFAULT_SINK@ toggle"
+  },
+  "custom/profile": {
+    "exec": "mq-profile",
+    "return-type": "json",
+    "interval": 15,
+    "signal": 8,
+    "menu": "on-click",
+    "menu-file": "@DESKTOP@/power-menu.xml",
+    "menu-actions": {
+      "pp-saver": "mq-profile set power-saver",
+      "pp-balanced": "mq-profile set balanced",
+      "pp-perf": "mq-profile set performance"
+    },
+    "hide-empty-text": true
+  },
+  "battery": {
+    "menu": "on-click",
+    "menu-file": "@DESKTOP@/power-menu.xml",
+    "menu-actions": {
+      "pp-saver": "mq-profile set power-saver",
+      "pp-balanced": "mq-profile set balanced",
+      "pp-perf": "mq-profile set performance"
+    },
+    "states": { "warning": 30, "critical": 15 },
+    "format": "Bat {capacity}%",
+    "format-charging": "Chg {capacity}%",
+    "format-plugged": "AC {capacity}%",
+    "format-full": "Full",
+    "tooltip-format": "{timeTo}   (click: power mode)"
+  },
+  "clock": {
+    "format": "{:%d %b  %H:%M}",
+    "tooltip-format": "<tt>{calendar}</tt>",
+    "calendar": { "mode": "month" }
+  },
+  "tray": { "spacing": 8 }
+}

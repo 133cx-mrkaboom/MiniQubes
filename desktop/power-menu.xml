@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <object class="GtkMenu" id="menu">
+    <property name="visible">True</property>
+    <child><object class="GtkMenuItem" id="pp-saver"><property name="visible">True</property><property name="label">Power saver  (longer battery)</property></object></child>
+    <child><object class="GtkMenuItem" id="pp-balanced"><property name="visible">True</property><property name="label">Balanced</property></object></child>
+    <child><object class="GtkMenuItem" id="pp-perf"><property name="visible">True</property><property name="label">Performance  (faster, hotter)</property></object></child>
+  </object>
+</interface>

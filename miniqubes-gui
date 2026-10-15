@@ -1,0 +1,648 @@
+#!/usr/bin/python3
+"""miniqubes-gui - a simple window for your qubes (boxes).
+
+Permissions (sound, camera) are off unless you turn them on for each qube.
+
+Make a qube, open programs in it, pick how locked down it is. No typing commands.
+
+Install:  sudo pacman -S --needed pyside6
+          sudo install -m755 miniqubes miniqubes-gui /usr/local/bin/
+Run:      miniqubes-gui
+
+Base system actions (set up, install programs, update) open a terminal so sudo can ask for your password.
+"""
+import configparser
+import glob
+import importlib.machinery
+import importlib.util
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+from PySide6.QtCore import QSize, Qt, QTimer
+from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
+from PySide6.QtWidgets import (
+    QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+    QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QScrollArea, QToolButton, QVBoxLayout, QWidget,
+)
+
+DEFAULT_TEMPLATE = "alpine"
+SUGGESTIONS = "firefox libreoffice vlc gimp thunderbird keepassxc mpv evince"
+KINDS = [  # template preset -> (title, what it means)
+    ("alpine", "Everyday", "keeps your files, has internet"),
+    ("custom", "Offline", "no internet, you pick the programs"),
+]
+SECURITY = [  # seccomp level -> (label, what it means)
+    ("low", "Basic", "blocks a few risky system features"),
+    ("standard", "Standard (recommended)", "blocks more risky system features"),
+    ("strict", "Strict", "blocks the most. Some programs may stop working"),
+]
+OTHER_SECURITY = {"none": "Off (no limits)", "custom": "Custom (set by hand in the config)"}
+
+
+def load_mq():
+    path = os.environ.get("MQ_CLI") or shutil.which("miniqubes")
+    if not path:
+        sys.exit("miniqubes-gui: `miniqubes` isn't in PATH. Install it first.")
+    loader = importlib.machinery.SourceFileLoader("mq", path)
+    spec = importlib.util.spec_from_loader("mq", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod, path
+
+
+MQ, CLI = load_mq()
+
+TERMS = [("foot", []), ("alacritty", ["-e"]), ("kitty", []), ("konsole", ["-e"]), ("qterminal", ["-e"]),
+         ("lxterminal", ["-e"]), ("xfce4-terminal", ["-x"]), ("gnome-terminal", ["--"]),
+         ("wezterm", ["start", "--"]), ("xterm", ["-e"])]
+
+
+def find_terminal():
+    for t, flags in TERMS:
+        if shutil.which(t):
+            return t, flags
+    return None
+
+
+def swatch(color, size=16):
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setBrush(QColor(color))
+    p.setPen(Qt.NoPen)
+    p.drawRoundedRect(0, 0, size, size, 4, 4)
+    p.end()
+    return QIcon(pm)
+
+
+def contrast(color):
+    c = QColor(color)
+    return "#000000" if (c.red() * 299 + c.green() * 587 + c.blue() * 114) / 1000 > 150 else "#ffffff"
+
+
+def find_icon(root, name):
+    if not name:
+        return QIcon()
+    if name.startswith("/"):
+        p = root / name.lstrip("/")
+        return QIcon(str(p)) if p.exists() else QIcon()
+    best, best_size = None, -1
+    for f in glob.glob(str(root / f"usr/share/icons/hicolor/*/apps/{name}.*")):
+        folder = Path(f).parent.parent.name
+        size = int(folder.split("x")[0]) if folder[:1].isdigit() else 64
+        if size <= 128 and size > best_size:
+            best, best_size = f, size
+    if not best:
+        hits = glob.glob(str(root / f"usr/share/pixmaps/{name}.*"))
+        best = hits[0] if hits else None
+    return QIcon(best) if best else QIcon()
+
+
+def template_apps(root):
+    apps = []
+    for f in sorted(glob.glob(str(root / "usr/share/applications/*.desktop"))):
+        cp = configparser.ConfigParser(interpolation=None, strict=False)
+        cp.optionxform = str
+        try:
+            cp.read(f, encoding="utf-8")
+        except Exception:
+            continue
+        if "Desktop Entry" not in cp:
+            continue
+        d = cp["Desktop Entry"]
+        if d.get("Type", "Application") != "Application":
+            continue
+        if d.get("NoDisplay", "").lower() == "true" or d.get("Hidden", "").lower() == "true":
+            continue
+        if d.get("Terminal", "").lower() == "true":
+            continue
+        try:
+            cmd = [t for t in shlex.split(d.get("Exec", "")) if not t.startswith("%")]
+        except ValueError:
+            continue
+        if cmd:
+            apps.append((d.get("Name", Path(f).stem), cmd, find_icon(root, d.get("Icon", ""))))
+    apps.sort(key=lambda a: a[0].lower())
+    return apps
+
+
+def kind_of(b):
+    if not b.get("persistent", True):
+        return "Throwaway"
+    return "Everyday" if b.get("network") in ("direct", "internet") else "Offline"
+
+
+def describe(level):
+    for key, _, text in SECURITY:
+        if key == level:
+            return text
+    return ""
+
+
+def clear_layout(layout):
+    while layout.count():
+        w = layout.takeAt(0).widget()
+        if w:
+            w.deleteLater()
+
+
+class PickProgram(QDialog):
+    def __init__(self, parent, apps):
+        super().__init__(parent)
+        self.setWindowTitle("Add a program")
+        self.resize(460, 600)
+        self.chosen = None
+        self.list = QListWidget()
+        self.list.setIconSize(QSize(40, 40))
+        for name, cmd, icon in apps:
+            it = QListWidgetItem(icon, name)
+            it.setData(Qt.UserRole, cmd)
+            self.list.addItem(it)
+        self.list.itemDoubleClicked.connect(lambda _: self.accept())
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("Pick a program to add to this qube:"))
+        lay.addWidget(self.list, 1)
+        lay.addWidget(bb)
+
+    def accept(self):
+        it = self.list.currentItem()
+        if it:
+            self.chosen = it.data(Qt.UserRole)
+            super().accept()
+
+
+class NewQube(QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("New qube")
+        self.name = QLineEdit()
+        self.name.setPlaceholderText("for example: school, shopping, bank")
+        self.kind = QComboBox()
+        for key, title, about in KINDS:
+            self.kind.addItem(f"{title}: {about}", key)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        form = QFormLayout(self)
+        form.addRow("Name", self.name)
+        form.addRow("Type", self.kind)
+        form.addRow(bb)
+
+    def accept(self):
+        if not MQ.NAME_RE.match(self.name.text().strip()):
+            QMessageBox.warning(self, "Name", "Use only small letters, numbers, - or _ (up to 32). "
+                                              "For example: school")
+            return
+        super().accept()
+
+
+class Main(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("MiniQubes")
+        self.resize(1100, 720)
+        self.name = None      # selected qube
+        self.color = "#2e7d32"
+        self.loading = False  # True while filling widgets from a qube, so changes aren't saved back
+        self.procs = []       # (Popen, log file) for programs started from here
+
+        # ---- left: qube list
+        self.qubes = QListWidget()
+        self.qubes.setIconSize(QSize(24, 24))
+        self.qubes.currentItemChanged.connect(self.on_select)
+        new = QPushButton("+ New qube")
+        new.setMinimumHeight(48)
+        new.clicked.connect(self.new_qube)
+        delete = QPushButton("Delete qube")
+        delete.clicked.connect(self.delete_qube)
+        left = QWidget()
+        lv = QVBoxLayout(left)
+        lv.addWidget(QLabel("<b>My qubes</b>"))
+        lv.addWidget(self.qubes, 1)
+        lv.addWidget(new)
+        lv.addWidget(delete)
+        left.setMaximumWidth(280)
+
+        # ---- right: the selected qube
+        self.title = QLabel()
+        self.notice = QLabel("The base system isn't set up yet. Click 'Set up base system' under My qubes (first time only).")
+        self.notice.setWordWrap(True)
+        self.notice.setStyleSheet("font-weight:bold;")
+        self.notice.hide()
+
+        self.grid = QGridLayout()
+        add = QPushButton("+ Add program")
+        add.clicked.connect(self.add_program)
+        remove = QPushButton("Remove program")
+        remove.clicked.connect(self.remove_program)
+        progs = QGroupBox("Programs (click one to open it)")
+        pv = QVBoxLayout(progs)
+        pv.addLayout(self.grid)
+        pr = QHBoxLayout()
+        pr.addWidget(add)
+        pr.addWidget(remove)
+        pr.addStretch(1)
+        pv.addLayout(pr)
+
+        self.internet = QComboBox()
+        self.internet.addItem("No network", "none")
+        self.internet.addItem("Internet only (blocks your local network)", "internet")
+        self.internet.addItem("Full (internet + your local network)", "direct")
+        self.internet.currentIndexChanged.connect(self.save_settings)
+        self.security = QComboBox()
+        self.security.currentIndexChanged.connect(self.on_security_changed)
+        self.security_help = QLabel()
+        self.security_help.setWordWrap(True)
+        self.forget = QCheckBox("Forget everything when I close it")
+        self.forget.toggled.connect(self.save_settings)
+        self.frame = QCheckBox("Colored frame around its windows")
+        self.frame.toggled.connect(self.save_settings)
+        self.sound = QCheckBox("Sound on (also allows the microphone)")
+        self.sound.toggled.connect(self.save_settings)
+        self.camera = QCheckBox("Camera on")
+        self.camera.toggled.connect(self.save_settings)
+        self.colorbtn = QPushButton()
+        self.colorbtn.clicked.connect(self.pick_color)
+        sg = QGroupBox("Settings (changes save automatically)")
+        sf = QFormLayout(sg)
+        sf.addRow("Network", self.internet)
+        sf.addRow("Security level", self.security)
+        sf.addRow("", self.security_help)
+        sf.addRow(self.forget)
+        sf.addRow(self.frame)
+        pg = QGroupBox("Permissions (all off until you turn them on)")
+        pf = QVBoxLayout(pg)
+        pf.addWidget(self.sound)
+        pf.addWidget(self.camera)
+        pf.addWidget(QLabel("Sound also gives the microphone: they share one connection, so it can't be split."))
+        sf.addRow(pg)
+        sf.addRow("Color", self.colorbtn)
+
+        self.shares = QListWidget()
+        self.shares.setMaximumHeight(120)
+        addf = QPushButton("+ Share a folder")
+        addf.clicked.connect(self.add_share)
+        remf = QPushButton("Stop sharing")
+        remf.clicked.connect(self.remove_share)
+        fg = QGroupBox("Shared folders (this qube can see these)")
+        fv = QVBoxLayout(fg)
+        fv.addWidget(self.shares)
+        fr = QHBoxLayout()
+        fr.addWidget(addf)
+        fr.addWidget(remf)
+        fr.addStretch(1)
+        fv.addLayout(fr)
+
+        self.details = QWidget()
+        dv = QVBoxLayout(self.details)
+        dv.setContentsMargins(0, 0, 0, 0)
+        dv.addWidget(progs)
+        dv.addWidget(sg)
+        dv.addWidget(fg)
+        dv.addStretch(1)
+
+        right = QWidget()
+        rv = QVBoxLayout(right)
+        rv.addWidget(self.title)
+        rv.addWidget(self.notice)
+        rv.addWidget(self.details, 1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(right)
+
+        central = QWidget()
+        cl = QHBoxLayout(central)
+        cl.addWidget(left)
+        cl.addWidget(scroll, 1)
+        self.setCentralWidget(central)
+
+        # ---- base system: admin actions, always visible (they change the template every qube uses)
+        self.tpl_label = QLabel()
+        self.tpl_label.setWordWrap(True)
+        self.build_btn = QPushButton("Set up base system (first time)")
+        self.build_btn.clicked.connect(self.build_base)
+        inst = QPushButton("Install programs...")
+        inst.clicked.connect(self.install_program)
+        upd = QPushButton("Update everything")
+        upd.clicked.connect(self.update_base)
+        adm = QPushButton("Admin shell (root)")
+        adm.clicked.connect(self.admin_shell)
+        self.admin_btns = [inst, upd, adm]
+        bg = QGroupBox("Base system (admin: changes every qube)")
+        bv = QVBoxLayout(bg)
+        bv.addWidget(self.tpl_label)
+        bv.addWidget(self.build_btn)
+        for b in self.admin_btns:
+            bv.addWidget(b)
+        lv.addWidget(bg)
+
+        self.reaper = QTimer(self)
+        self.reaper.timeout.connect(self.reap)
+        self.reaper.start(1000)
+        QApplication.instance().applicationStateChanged.connect(
+            lambda s: self.refresh() if s == Qt.ApplicationActive else None)
+        self.refresh()
+
+    # ------------------------------------------------------------ data
+    def load(self, name):
+        try:
+            return MQ.load_box(name)
+        except SystemExit:
+            return None
+
+    def programs_of(self, b):
+        """[(command string, display name, icon)] for the qube's programs."""
+        root = MQ.TEMPLATES / b["template"]
+        known = {shlex.join(cmd): (name, icon) for name, cmd, icon in template_apps(root)} if root.is_dir() else {}
+        out = []
+        for cmd in b.get("apps", []):
+            fallback = (cmd.split() or ["?"])[0]
+            name, icon = known.get(cmd, (fallback, QIcon()))
+            out.append((cmd, name, icon))
+        return out
+
+    def refresh(self, select=None):
+        cur = select or self.name
+        self.qubes.blockSignals(True)
+        self.qubes.clear()
+        for n in (sorted(p.stem for p in MQ.CONF.glob("*.toml")) if MQ.CONF.is_dir() else []):
+            b = self.load(n)
+            if b is None:
+                continue
+            it = QListWidgetItem(swatch(b["color"], 20), f"{n}\n{kind_of(b)}")
+            it.setData(Qt.UserRole, n)
+            self.qubes.addItem(it)
+            if n == cur:
+                self.qubes.setCurrentItem(it)
+        self.qubes.blockSignals(False)
+        if self.qubes.currentItem() is None and self.qubes.count():
+            self.qubes.setCurrentRow(0)
+        self.on_select(self.qubes.currentItem())
+        self.refresh_admin()
+
+    def on_select(self, item, _prev=None):
+        self.name = item.data(Qt.UserRole) if item else None
+        b = self.load(self.name) if self.name else None
+        if b is None:
+            self.name = None
+            self.title.setText("  No qube selected. Click '+ New qube'.")
+            self.title.setStyleSheet("font-size:22pt; font-weight:bold; padding:10px;")
+            self.notice.hide()
+            self.details.setEnabled(False)
+            clear_layout(self.grid)
+            self.shares.clear()
+            return
+
+        c = b["color"]
+        self.title.setText(f"  {self.name}")
+        self.title.setStyleSheet(f"font-size:22pt; font-weight:bold; padding:10px; background:{c}; "
+                                 f"color:{contrast(c)};")
+        self.details.setEnabled(True)
+        self.loading = True
+        try:
+            i = self.internet.findData(b.get("network", "none"))
+            self.internet.setCurrentIndex(i if i >= 0 else 0)
+            self.forget.setChecked(not b.get("persistent", True))
+            self.frame.setChecked(bool(b.get("frame", True)))
+            self.sound.setChecked(bool(b.get("sound")))
+            self.camera.setChecked(bool(b.get("camera")))
+            self.set_color(c)
+            level = b.get("seccomp", "none")
+            self.security.clear()
+            for key, label, _ in SECURITY:
+                self.security.addItem(label, key)
+            if level not in [k for k, _, _ in SECURITY]:
+                self.security.addItem(OTHER_SECURITY.get(level, level), level)
+            self.security.setCurrentIndex(self.security.findData(level))
+            self.security_help.setText(describe(level))
+            self.fill_shares(b)
+            self.fill_programs(b)
+            self.notice.setVisible(not (MQ.TEMPLATES / b["template"]).is_dir())
+        finally:
+            self.loading = False
+
+    def fill_programs(self, b):
+        clear_layout(self.grid)
+        progs = self.programs_of(b)
+        if not progs:
+            self.grid.addWidget(QLabel("No programs yet. Click '+ Add program' below."), 0, 0)
+            return
+        for i, (cmd, name, icon) in enumerate(progs):
+            btn = QToolButton()
+            btn.setText(name)
+            btn.setIcon(icon)
+            btn.setIconSize(QSize(64, 64))
+            btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+            btn.setMinimumSize(150, 130)
+            btn.clicked.connect(lambda _=False, c=cmd: self.launch(c))
+            self.grid.addWidget(btn, i // 4, i % 4)
+
+    def fill_shares(self, b):
+        self.shares.clear()
+        for s in b.get("shares", []):
+            path, mode = s.rsplit(":", 1)
+            self.shares.addItem(f"{path}   ({'can change files' if mode == 'rw' else 'view only'})")
+
+    # ------------------------------------------------------------ settings
+    def set_color(self, c):
+        self.color = c
+        self.colorbtn.setText(c)
+        self.colorbtn.setStyleSheet(f"background:{c}; color:{contrast(c)}; padding:6px 14px;")
+
+    def pick_color(self):
+        c = QColorDialog.getColor(QColor(self.color), self, "Qube color")
+        if c.isValid():
+            self.set_color(c.name())
+            self.save_settings()
+
+    def on_security_changed(self, _index=0):
+        self.security_help.setText(describe(self.security.currentData()))
+        self.save_settings()
+
+    def save_settings(self, *_):
+        if self.loading or not self.name:
+            return
+        b = self.load(self.name)
+        if b is None:
+            return
+        b["network"] = self.internet.currentData()
+        b["persistent"] = not self.forget.isChecked()
+        b["tier"] = "disposable" if self.forget.isChecked() else "trusted"
+        b["frame"] = self.frame.isChecked()
+        b["sound"] = self.sound.isChecked()
+        b["camera"] = self.camera.isChecked()
+        b["seccomp"] = self.security.currentData()
+        b["color"] = self.color
+        MQ.write_box(self.name, b)
+        self.refresh()
+
+    # ------------------------------------------------------------ qubes
+    def new_qube(self):
+        dlg = NewQube(self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        name = dlg.name.text().strip()
+        r = subprocess.run([CLI, "create", name, "--preset", dlg.kind.currentData()],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            QMessageBox.warning(self, "Couldn't make qube", (r.stdout + r.stderr).strip())
+            return
+        self.refresh(select=name)
+
+    def delete_qube(self):
+        if not self.name:
+            return
+        if QMessageBox.question(self, "Delete qube", f"Delete '{self.name}' and everything saved in it? "
+                                                    f"This can't be undone.") != QMessageBox.Yes:
+            return
+        r = subprocess.run([CLI, "delete", self.name, "--yes"], capture_output=True, text=True)
+        if r.returncode != 0:
+            QMessageBox.warning(self, "Couldn't delete", (r.stdout + r.stderr).strip())
+        self.name = None
+        self.refresh()
+
+    def add_program(self):
+        if not self.name:
+            return
+        b = self.load(self.name)
+        root = MQ.TEMPLATES / b["template"]
+        if not root.is_dir():
+            QMessageBox.information(self, "Base system missing",
+                                    "Set up the base system first: Setup > Set up the base system.")
+            return
+        apps = template_apps(root)
+        if not apps:
+            QMessageBox.information(self, "No programs", "No programs are installed in the base system yet. "
+                                                         "Use Setup > Install a program into the base system.")
+            return
+        dlg = PickProgram(self, apps)
+        if dlg.exec() != QDialog.Accepted or not dlg.chosen:
+            return
+        cmd = shlex.join(dlg.chosen)
+        if cmd not in b.get("apps", []):
+            b["apps"] = [*b.get("apps", []), cmd]
+            MQ.write_box(self.name, b)
+        self.refresh(select=self.name)
+
+    def remove_program(self):
+        if not self.name:
+            return
+        b = self.load(self.name)
+        progs = self.programs_of(b)
+        if not progs:
+            QMessageBox.information(self, "No programs", "This qube has no programs to remove.")
+            return
+        labels = [name for _, name, _ in progs]
+        item, ok = QInputDialog.getItem(self, "Remove a program", "Remove which program?", labels, 0, False)
+        if not ok:
+            return
+        i = labels.index(item)
+        b["apps"] = [cmd for j, (cmd, _, _) in enumerate(progs) if j != i]
+        MQ.write_box(self.name, b)
+        self.refresh(select=self.name)
+
+    def add_share(self):
+        if not self.name:
+            return
+        d = QFileDialog.getExistingDirectory(self, "Pick a folder to share with this qube")
+        if not d:
+            return
+        can_change = QMessageBox.question(
+            self, "Share folder",
+            f"Let this qube CHANGE files in:\n{d}\n\nYes = it can change and delete files\n"
+            f"No = it can only look") == QMessageBox.Yes
+        b = self.load(self.name)
+        b["shares"] = [*b.get("shares", []), f"{d}:{'rw' if can_change else 'ro'}"]
+        MQ.write_box(self.name, b)
+        self.refresh(select=self.name)
+
+    def remove_share(self):
+        row = self.shares.currentRow()
+        if not self.name or row < 0:
+            return
+        b = self.load(self.name)
+        b["shares"] = [s for j, s in enumerate(b.get("shares", [])) if j != row]
+        MQ.write_box(self.name, b)
+        self.refresh(select=self.name)
+
+    # ------------------------------------------------------------ running programs
+    def launch(self, cmd):
+        if not self.name:
+            return
+        fd, log = tempfile.mkstemp(prefix="mq-run-", suffix=".log")
+        with os.fdopen(fd, "w") as f:
+            p = subprocess.Popen([CLI, "run", self.name, "--", *shlex.split(cmd)],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=f,
+                                 start_new_session=True)
+        self.procs.append((p, log))
+
+    def reap(self):
+        """Collect finished programs; show an error if one failed to start."""
+        for p, log in list(self.procs):
+            code = p.poll()
+            if code is None:
+                continue
+            self.procs.remove((p, log))
+            text = Path(log).read_text(errors="replace").strip()[-1500:] if Path(log).exists() else ""
+            Path(log).unlink(missing_ok=True)
+            if code != 0:
+                QMessageBox.warning(self, "Couldn't open that program", text or f"Exit code {code}")
+
+    # ------------------------------------------------------------ setup (opens a terminal for sudo)
+    def terminal(self, argv):
+        t = find_terminal()
+        if not t:
+            QMessageBox.warning(self, "No terminal", "Couldn't find a terminal program (foot, kitty, alacritty, "
+                                                     "konsole, xterm ...). Install one.")
+            return
+        term, flags = t
+        script = shlex.join(argv) + '; echo; printf "Done. Press Enter to close... "; read _'
+        subprocess.Popen([term, *flags, "sh", "-c", script], start_new_session=True)
+
+    def build_base(self):
+        self.terminal([CLI, "template", "build", DEFAULT_TEMPLATE])
+
+    def update_base(self):
+        self.terminal([CLI, "template", "update", DEFAULT_TEMPLATE])
+
+    def admin_shell(self):
+        self.terminal([CLI, "template", "shell", DEFAULT_TEMPLATE])
+
+    def install_program(self):
+        text, ok = QInputDialog.getText(
+            self, "Install programs", "Package names, space separated (for example: vlc libreoffice).\n"
+                                      "For sound, include: libpulse\nIdeas: " + SUGGESTIONS)
+        if ok and text.strip():
+            self.terminal([CLI, "template", "install", DEFAULT_TEMPLATE, *text.split()])
+
+    def refresh_admin(self):
+        ready = (MQ.TEMPLATES / DEFAULT_TEMPLATE).is_dir()
+        self.build_btn.setVisible(not ready)
+        for b in self.admin_btns:
+            b.setEnabled(ready)
+        self.tpl_label.setText(
+            f"Base system '{DEFAULT_TEMPLATE}' is ready. Programs installed here appear in every qube."
+            if ready else "The base system isn't set up yet. Click the button below (first time only).")
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("MiniQubes")
+    app.setStyleSheet("QWidget { font-size: 13pt; } QPushButton { padding: 8px 16px; }")
+    w = Main()
+    w.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

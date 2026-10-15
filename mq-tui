@@ -1,0 +1,22 @@
+#!/bin/sh
+# mq-tui wifi|audio - open a text-mode settings screen in a terminal (used by the bar's wifi / volume buttons).
+case "$1" in
+  wifi)  title="Wi-Fi"; tool="nmtui"; hint="install NetworkManager (nmtui)" ;;
+  audio) title="Audio"; tool=""; hint="install pulsemixer" ;;
+  *) echo "usage: mq-tui wifi|audio" >&2; exit 1 ;;
+esac
+if [ "$1" = audio ]; then
+  for c in pulsemixer wiremix; do command -v "$c" >/dev/null 2>&1 && tool=$c && break; done
+  [ -n "$tool" ] || { command -v alsamixer >/dev/null 2>&1 && tool="alsamixer -D pulse"; }
+fi
+script="${tool:-false}"
+[ -n "$tool" ] || script="echo \"nothing to run: $hint\"; printf 'press Enter '; read x"
+for t in foot xterm alacritty kitty; do
+  command -v "$t" >/dev/null 2>&1 || continue
+  case $t in
+    kitty) exec kitty --title "$title" sh -c "$script" ;;
+    *)     exec "$t" -T "$title" -e sh -c "$script" ;;
+  esac
+done
+echo "mq-tui: no terminal found (install foot)" >&2
+exit 1

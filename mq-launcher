@@ -1,0 +1,319 @@
+#!/usr/bin/python3
+"""mq-launcher - pick a qube, pick an app, run it inside that qube.   (mq-launcher --power = power menu)
+
+  type        filter the app list (if nothing matches, Enter runs what you typed as a command in the qube)
+  Up/Down     choose app            PageUp/PageDown   choose qube
+  Enter       run it                Esc               close
+"""
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import tomllib
+from pathlib import Path
+
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer
+from PySide6.QtGui import QColor, QIcon, QPalette, QPixmap
+from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+                               QListWidgetItem, QMessageBox, QPushButton, QVBoxLayout, QWidget)
+
+CONF = Path(os.environ.get("MQ_CONF", Path.home() / ".config/miniqubes/boxes"))
+TEMPLATES = Path(os.environ.get("MQ_TEMPLATES", "/var/lib/miniqubes/templates"))
+CLI = os.environ.get("MQ_CLI") or shutil.which("miniqubes") or "/usr/local/bin/miniqubes"
+
+
+# ------------------------------------------------------------------ data
+def load_boxes():
+    out = []
+    for p in sorted(CONF.glob("*.toml")):
+        try:
+            b = tomllib.loads(p.read_text())
+            b.setdefault("name", p.stem)
+            out.append(b)
+        except Exception:
+            pass
+    return out
+
+
+def has(template, rel):
+    return (TEMPLATES / template / rel).exists()
+
+
+def terminal_cmd(template):
+    for t in ("foot", "xterm"):
+        if has(template, f"usr/bin/{t}"):
+            return [t]
+    return None
+
+
+def field_codes(m):
+    return "%" if m.group(1) == "%" else ""
+
+
+def desktop_apps(template):
+    """[(label, argv)] from the .desktop files inside the template (read-only peek, nothing runs)."""
+    apps = []
+    term = terminal_cmd(template)
+    root = TEMPLATES / template
+    for d in ("usr/share/applications", "usr/local/share/applications"):
+        try:
+            files = sorted((root / d).glob("*.desktop"))
+        except OSError:
+            continue
+        for f in files:
+            try:
+                lines = f.read_text(errors="replace").splitlines()
+            except OSError:
+                continue
+            ent, inside = {}, False
+            for ln in lines:
+                ln = ln.strip()
+                if ln.startswith("["):
+                    inside = ln == "[Desktop Entry]"
+                elif inside and "=" in ln and not ln.startswith("#"):
+                    k, v = ln.split("=", 1)
+                    ent.setdefault(k.strip(), v.strip())
+            if ent.get("Type", "Application") != "Application" or "true" in (ent.get("NoDisplay", ""), ent.get("Hidden", "")):
+                continue
+            if not ent.get("Name") or not ent.get("Exec"):
+                continue
+            try:
+                argv = shlex.split(re.sub(r"%(.)", field_codes, ent["Exec"]))
+            except ValueError:
+                continue
+            if not argv:
+                continue
+            if ent.get("Terminal") == "true":
+                if not term:
+                    continue
+                argv = term + argv
+            apps.append((ent["Name"], argv))
+    return apps
+
+
+def apps_for(box):
+    t = box["template"]
+    items, seen = [], set()
+    for a in box.get("apps", []):
+        items.append((f"{a}   (default)", shlex.split(a)))
+        seen.add(tuple(shlex.split(a)))
+    term = terminal_cmd(t)
+    if term:
+        items.append(("Terminal", term))
+        seen.add(tuple(term))
+    for label, argv in sorted(desktop_apps(t), key=lambda x: x[0].lower()):
+        if tuple(argv) in seen:
+            continue
+        seen.add(tuple(argv))
+        items.append((label, argv))
+    return items
+
+
+def dot(color, size=16):
+    pm = QPixmap(size, size)
+    pm.fill(QColor(color))
+    return QIcon(pm)
+
+
+# ------------------------------------------------------------------ launcher window
+class Keys(QObject):
+    def __init__(self, win):
+        super().__init__(win)
+        self.win = win
+
+    def eventFilter(self, obj, ev):
+        if ev.type() == QEvent.KeyPress:
+            k = ev.key()
+            if k in (Qt.Key_Up, Qt.Key_Down):
+                self.win.step(self.win.apps, -1 if k == Qt.Key_Up else 1)
+                return True
+            if k in (Qt.Key_PageUp, Qt.Key_PageDown):
+                self.win.step(self.win.qubes, -1 if k == Qt.Key_PageUp else 1)
+                return True
+            if k == Qt.Key_Escape:
+                self.win.close()
+                return True
+        return False
+
+
+class Launcher(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("MiniQubes")
+        self.resize(700, 460)
+        self.boxes = load_boxes()
+        self.cache = {}
+
+        self.qubes = QListWidget()
+        self.qubes.setFixedWidth(190)
+        for b in self.boxes:
+            it = QListWidgetItem(dot(b.get("color", "#888888")), b["name"])
+            it.setToolTip(f"{b['template']} · {b.get('network', '?')} · {b.get('tier', '')}")
+            self.qubes.addItem(it)
+
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("type to filter apps, or type a command to run in this qube…")
+        self.apps = QListWidget()
+        self.frame = QCheckBox("colored window frame")
+        self.status = QLabel("")
+        self.status.setStyleSheet("color: #9aa0ab")
+
+        right = QVBoxLayout()
+        right.addWidget(self.search)
+        right.addWidget(self.apps, 1)
+        bottom = QHBoxLayout()
+        bottom.addWidget(self.frame)
+        bottom.addStretch(1)
+        bottom.addWidget(self.status)
+        right.addLayout(bottom)
+        lay = QHBoxLayout(self)
+        lay.addWidget(self.qubes)
+        lay.addLayout(right, 1)
+
+        self.qubes.currentRowChanged.connect(self.fill_apps)
+        self.search.textChanged.connect(self.filter_apps)
+        self.search.returnPressed.connect(self.go)
+        self.apps.itemActivated.connect(lambda _: self.go())
+        self.keys = Keys(self)
+        self.search.installEventFilter(self.keys)
+        self.apps.installEventFilter(self.keys)
+        self.qubes.installEventFilter(self.keys)
+
+        if not self.boxes:
+            self.status.setText("no qubes yet. open Manage and create one")
+        else:
+            self.qubes.setCurrentRow(0)
+        self.search.setFocus()
+
+    def box(self):
+        r = self.qubes.currentRow()
+        return self.boxes[r] if 0 <= r < len(self.boxes) else None
+
+    def step(self, lst, d):
+        n = lst.count()
+        if n:
+            lst.setCurrentRow(max(0, min(n - 1, lst.currentRow() + d)))
+
+    def fill_apps(self, _=None):
+        b = self.box()
+        self.apps.clear()
+        if not b:
+            return
+        if b["name"] not in self.cache:
+            self.cache[b["name"]] = apps_for(b)
+        self.items = self.cache[b["name"]]
+        for label, argv in self.items:
+            it = QListWidgetItem(label)
+            it.setData(Qt.UserRole, argv)
+            self.apps.addItem(it)
+        can_frame = has(b["template"], "usr/bin/labwc")
+        self.frame.setEnabled(can_frame)
+        self.frame.setChecked(can_frame)
+        self.frame.setToolTip("" if can_frame else f"install labwc in the {b['template']} template to enable this")
+        self.filter_apps(self.search.text())
+
+    def filter_apps(self, text):
+        text = text.strip().lower()
+        first = None
+        for i in range(self.apps.count()):
+            it = self.apps.item(i)
+            hide = bool(text) and text not in it.text().lower()
+            it.setHidden(hide)
+            if not hide and first is None:
+                first = i
+        if first is not None:
+            self.apps.setCurrentRow(first)
+        else:
+            self.apps.setCurrentRow(-1)
+
+    def go(self):
+        b = self.box()
+        if not b:
+            return
+        it = self.apps.currentItem()
+        text = self.search.text().strip()
+        if it is not None and not it.isHidden():
+            argv = it.data(Qt.UserRole)
+        elif text:
+            try:
+                argv = shlex.split(text)
+            except ValueError as e:
+                self.status.setText(str(e))
+                return
+        else:
+            return
+        self.launch(b, argv)
+
+    def launch(self, b, argv):
+        log = tempfile.NamedTemporaryFile(prefix="mq-launch-", suffix=".log", delete=False)
+        log.close()
+        run = [CLI, "run"] + (["--frame"] if self.frame.isChecked() else []) + [b["name"], "--", *argv]
+        # The sh stays alive as the parent of the sandbox (bwrap dies with its parent), so the app keeps
+        # running after this window closes. It also captures error output so we can show it.
+        self.proc = subprocess.Popen(["sh", "-c", 'exec 2>"$0"; "$@"; rc=$?; exit $rc', log.name, *run],
+                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, start_new_session=True)
+        self.log = log.name
+        self.status.setText(f"starting {argv[0]} in {b['name']}…")
+        self.setEnabled(False)
+        QTimer.singleShot(2000, self.check)
+
+    def check(self):
+        rc = self.proc.poll()
+        msg = ""
+        try:
+            msg = Path(self.log).read_text(errors="replace").strip()
+            os.unlink(self.log)
+        except OSError:
+            pass
+        if rc not in (None, 0):
+            self.setEnabled(True)
+            self.status.setText("")
+            QMessageBox.warning(self, "Couldn't start it", msg or f"exited with code {rc}")
+            self.search.setFocus()
+        else:
+            QApplication.quit()
+
+
+# ------------------------------------------------------------------ power menu
+def power_menu():
+    d = QDialog()
+    d.setWindowTitle("Power")
+    lay = QVBoxLayout(d)
+    for label, cmd in (("Log out", ["mq-logout"]), ("Suspend", ["systemctl", "suspend"]),
+                       ("Restart", ["systemctl", "reboot"]), ("Shut down", ["systemctl", "poweroff"])):
+        b = QPushButton(label)
+        b.setMinimumHeight(36)
+        b.clicked.connect(lambda _=False, c=cmd: (subprocess.Popen(c, start_new_session=True), d.accept()))
+        lay.addWidget(b)
+    c = QPushButton("Cancel")
+    c.clicked.connect(d.reject)
+    lay.addWidget(c)
+    d.setMinimumWidth(240)
+    return d
+
+
+def dark(app):
+    app.setStyle("Fusion")
+    p = QPalette()
+    for role, col in ((QPalette.Window, "#1b1e27"), (QPalette.WindowText, "#d7dae0"), (QPalette.Base, "#14161c"),
+                      (QPalette.AlternateBase, "#1b1e27"), (QPalette.Text, "#d7dae0"), (QPalette.Button, "#262b38"),
+                      (QPalette.ButtonText, "#d7dae0"), (QPalette.Highlight, "#2e7d32"),
+                      (QPalette.HighlightedText, "#ffffff"), (QPalette.PlaceholderText, "#6c7280")):
+        p.setColor(role, QColor(col))
+    app.setPalette(p)
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setDesktopFileName("mq-launcher")
+    dark(app)
+    w = power_menu() if "--power" in sys.argv else Launcher()
+    w.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

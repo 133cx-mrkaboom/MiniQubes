@@ -1,0 +1,26 @@
+#!/bin/sh
+# mq-profile            print the current power mode for the bar (waybar JSON)
+# mq-profile set MODE   MODE = power-saver | balanced | performance
+if [ "$1" = set ]; then
+  if err=$(powerprofilesctl set "$2" 2>&1); then
+    pkill -RTMIN+8 -x waybar 2>/dev/null   # refresh the bar label right away
+    exit 0
+  fi
+  if command -v tlp >/dev/null 2>&1; then
+    hint="TLP is installed and takes over power management, so power-profiles-daemon can't run.
+Pick one: remove TLP (sudo pacman -Rns tlp) then: sudo systemctl enable --now power-profiles-daemon"
+  else
+    hint="needs the power-profiles-daemon service: sudo systemctl enable --now power-profiles-daemon
+('performance' only exists on some laptops)"
+  fi
+  msg="Couldn't switch to '$2': $err
+
+$hint"
+  for t in foot xterm; do
+    command -v "$t" >/dev/null 2>&1 && exec "$t" -e sh -c 'printf "%s\n\npress Enter " "$1"; read x' sh "$msg"
+  done
+  exit 1
+fi
+p=$(powerprofilesctl get 2>/dev/null) || { echo '{"text":""}'; exit 0; }   # no daemon: hide the label
+case $p in power-saver) t=Saver ;; balanced) t=Balanced ;; performance) t=Perf ;; *) t=$p ;; esac
+printf '{"text":"%s","class":"%s","tooltip":"Power mode: %s  (click to change)"}\n' "$t" "$p" "$p"
