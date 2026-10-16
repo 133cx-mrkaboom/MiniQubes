@@ -1,7 +1,3 @@
-Here’s a full README that keeps the same casual, privacy-focused, no-BS vibe while making the project sound more complete and the installation instructions clearer.
-
-Writing
-
 # MiniQubes
 
 MiniQubes is for people who want better compartmentalisation like Qubes OS, without the overhead of running a bunch of virtual machines.
