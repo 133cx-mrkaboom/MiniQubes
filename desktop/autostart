@@ -3,12 +3,16 @@
 D="${MQ_DESKTOP:-$HOME/.config/miniqubes/desktop}"
 LP="${LABWC_PID:-$PPID}"   # the compositor: everything started here stops when it does
 
-# wallpaper: drop a wallpaper.png / wallpaper.jpg in the desktop folder to use a picture.
+# wallpaper: Settings can change it (picture, solid color, light/dark); it restarts itself so changes show at once.
 # (swaybg is a plain background layer, it can't be clicked, so clicking the wallpaper does nothing)
-WALL=$(ls "$D"/wallpaper.png "$D"/wallpaper.jpg "$D"/wallpaper.jpeg 2>/dev/null | head -n1)
-if [ -n "$WALL" ]; then swaybg -m fill -i "$WALL" >/dev/null 2>&1 &
-else swaybg -c '#14161c' >/dev/null 2>&1 &
-fi
+( while kill -0 "$LP" 2>/dev/null; do
+    WALL=$(ls "$D"/wallpaper.png "$D"/wallpaper.jpg "$D"/wallpaper.jpeg 2>/dev/null | head -n1)
+    THEME=$(cat "$D/theme" 2>/dev/null)
+    COL=$(cat "$D/wallcolor" 2>/dev/null)
+    if [ -z "$COL" ]; then if [ "$THEME" = light ]; then COL='#e6e8ee'; else COL='#14161c'; fi; fi
+    if [ -n "$WALL" ]; then swaybg -m fill -i "$WALL"; else swaybg -c "$COL"; fi
+    sleep 1
+  done ) >/dev/null 2>&1 &
 
 # build the Launcher menu (qube -> apps) before the bar starts, then keep it up to date
 mq-menu --once >/dev/null 2>&1
@@ -18,4 +22,9 @@ mq-menu --daemon "$LP" >/dev/null 2>&1 &
 command -v copyq >/dev/null 2>&1 && copyq --start-server >/dev/null 2>&1 &
 
 # the bar; restarts itself if it crashes, but stops when the desktop ends (so sessions never pile up bars)
-( while kill -0 "$LP" 2>/dev/null; do waybar -c "$D/waybar.json" -s "$D/waybar.css"; sleep 1; done ) >/dev/null 2>&1 &
+( while kill -0 "$LP" 2>/dev/null; do
+    CSS="$D/waybar.css"
+    if [ "$(cat "$D/theme" 2>/dev/null)" = light ] && [ -f "$D/waybar-light.css" ]; then CSS="$D/waybar-light.css"; fi
+    waybar -c "$D/waybar.json" -s "$CSS"
+    sleep 1
+  done ) >/dev/null 2>&1 &

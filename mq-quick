@@ -11,7 +11,9 @@ for m in fuzzel wofi bemenu; do pkill -x "$m" 2>/dev/null && exit 0; done
 
 if command -v fuzzel >/dev/null 2>&1; then
   set -- fuzzel --dmenu
-  [ -f "$D/fuzzel.ini" ] && set -- "$@" --config "$D/fuzzel.ini"
+  ini="$D/fuzzel.ini"
+  [ "$(cat "$D/theme" 2>/dev/null)" = light ] && [ -f "$D/fuzzel-light.ini" ] && ini="$D/fuzzel-light.ini"
+  [ -f "$ini" ] && set -- "$@" --config "$ini"
 elif command -v wofi >/dev/null 2>&1;   then set -- wofi --dmenu --prompt run
 elif command -v bemenu >/dev/null 2>&1; then set -- bemenu -p run
 else exec mq-launcher      # no light picker installed: fall back to the Qt one

@@ -57,4 +57,7 @@ export MQ_DESKTOP=$DST
 export WLR_RENDERER_ALLOW_SOFTWARE=1        # fall back to software rendering instead of failing
 if (( SOFT )); then export WLR_RENDERER=pixman WLR_NO_HARDWARE_CURSORS=1; fi
 echo $$ > "${XDG_RUNTIME_DIR:-/tmp}/miniqubes-session.pid"   # used by mq-logout as a fallback
-exec labwc -C "$DST"
+LOGD="${XDG_CACHE_HOME:-$HOME/.cache}/miniqubes"; mkdir -p "$LOGD" 2>/dev/null || true
+[ -f "$LOGD/session.log" ] && mv -f "$LOGD/session.log" "$LOGD/session.log.old" 2>/dev/null || true
+echo "log: $LOGD/session.log" >&2
+exec labwc -C "$DST" >"$LOGD/session.log" 2>&1

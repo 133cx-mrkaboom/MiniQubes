@@ -1,0 +1,50 @@
+* {
+  font-family: "DejaVu Sans", sans-serif;
+  font-size: 13px;
+  border: none;
+  border-radius: 0;
+  min-height: 0;
+}
+window#waybar { background: #eef0f4; color: #1c1f26; }
+
+/* Launcher = the green button (qube -> app dropdown, power is in there too) */
+#custom-launcher {
+  background: #2e7d32; color: #ffffff; font-weight: bold;
+  padding: 0 14px; margin: 4px 3px; border-radius: 7px;
+}
+#custom-launcher:hover { background: #3a9a40; }
+#custom-manage { padding: 0 11px; margin: 4px 2px; border-radius: 7px; background: #dde1ea; }
+#custom-manage:hover { background: #cdd3e0; }
+
+/* workspaces: four small squares, the current one is filled blue */
+#workspaces { margin: 0 8px; }
+#workspaces button {
+  min-width: 18px; min-height: 18px; padding: 0; margin: 8px 3px; border-radius: 4px;
+  background: #c3c9d6; color: transparent; font-size: 1px;
+}
+#workspaces button:hover { background: #a3abbf; }
+#workspaces button.active { background: #4c8dff; }
+
+#taskbar button {
+  padding: 0 10px; margin: 4px 2px; border-radius: 7px;
+  background: #dde1ea; color: #1c1f26;
+}
+#taskbar button.active { background: #b9c1d3; border-bottom: 2px solid #4c8dff; }
+#taskbar button:hover { background: #cdd3e0; }
+
+#custom-running, #network, #pulseaudio, #custom-profile, #battery, #clock, #tray { padding: 0 7px; }
+#custom-profile:hover, #battery:hover { background: #dde1ea; border-radius: 7px; }
+#custom-profile.performance { color: #c8651c; }
+#custom-profile.power-saver { color: #2e8f4a; }
+#network:hover, #pulseaudio:hover { background: #dde1ea; border-radius: 7px; }
+#clock { font-weight: bold; }
+#custom-running.idle { color: #80869a; }
+#battery.warning { color: #a97a00; }
+#battery.critical { color: #d02a47; }
+#battery.charging { color: #2e8f4a; }
+#pulseaudio.muted, #network.disconnected { color: #80869a; }
+
+tooltip { background: #f7f8fb; border: 1px solid #b9c1d3; }
+menu { background: #f7f8fb; color: #1c1f26; border: 1px solid #b9c1d3; border-radius: 6px; padding: 4px; }
+menu menuitem { padding: 5px 14px; border-radius: 4px; }
+menu menuitem:hover { background: #2e7d32; color: #ffffff; }

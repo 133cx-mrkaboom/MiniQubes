@@ -267,6 +267,10 @@ class Main(QMainWindow):
         self.forget.toggled.connect(self.save_settings)
         self.frame = QCheckBox("Colored frame around its windows")
         self.frame.toggled.connect(self.save_settings)
+        self.clip = QCheckBox("Share clipboard with the desktop and other qubes")
+        self.clip.setToolTip("Copy/paste text between this qube and everything else. Works for colored-frame qubes. "
+                             "Turn off for qubes that handle passwords or anything private.")
+        self.clip.toggled.connect(self.save_settings)
         self.sound = QCheckBox("Sound on (also allows the microphone)")
         self.sound.toggled.connect(self.save_settings)
         self.camera = QCheckBox("Camera on")
@@ -280,6 +284,8 @@ class Main(QMainWindow):
         sf.addRow("", self.security_help)
         sf.addRow(self.forget)
         sf.addRow(self.frame)
+        sf.addRow(self.clip)
+        sf.addRow(QLabel("Needs wl-clipboard in the base system: Install programs... and add  wl-clipboard"))
         pg = QGroupBox("Permissions (all off until you turn them on)")
         pf = QVBoxLayout(pg)
         pf.addWidget(self.sound)
@@ -345,6 +351,10 @@ class Main(QMainWindow):
         for b in self.admin_btns:
             bv.addWidget(b)
         lv.addWidget(bg)
+        sett = QPushButton("Desktop settings...")
+        sett.setToolTip("Number of desktops, light/dark, bar, wallpaper, keybinds, system terminal and upgrades")
+        sett.clicked.connect(lambda: subprocess.Popen(["mq-settings"], start_new_session=True))
+        lv.addWidget(sett)
 
         self.reaper = QTimer(self)
         self.reaper.timeout.connect(self.reap)
@@ -414,6 +424,7 @@ class Main(QMainWindow):
             self.internet.setCurrentIndex(i if i >= 0 else 0)
             self.forget.setChecked(not b.get("persistent", True))
             self.frame.setChecked(bool(b.get("frame", True)))
+            self.clip.setChecked(bool(b.get("clipboard", True)))
             self.sound.setChecked(bool(b.get("sound")))
             self.camera.setChecked(bool(b.get("camera")))
             self.set_color(c)
@@ -479,6 +490,7 @@ class Main(QMainWindow):
         b["persistent"] = not self.forget.isChecked()
         b["tier"] = "disposable" if self.forget.isChecked() else "trusted"
         b["frame"] = self.frame.isChecked()
+        b["clipboard"] = self.clip.isChecked()
         b["sound"] = self.sound.isChecked()
         b["camera"] = self.camera.isChecked()
         b["seccomp"] = self.security.currentData()
@@ -621,7 +633,7 @@ class Main(QMainWindow):
     def install_program(self):
         text, ok = QInputDialog.getText(
             self, "Install programs", "Package names, space separated (for example: vlc libreoffice).\n"
-                                      "For sound, include: libpulse\nIdeas: " + SUGGESTIONS)
+                                      "For sound, include: libpulse\nFor copy/paste between qubes, include: wl-clipboard\nIdeas: " + SUGGESTIONS)
         if ok and text.strip():
             self.terminal([CLI, "template", "install", DEFAULT_TEMPLATE, *text.split()])
 

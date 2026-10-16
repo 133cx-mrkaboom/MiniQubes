@@ -1,0 +1,27 @@
+#!/bin/sh
+# mq-clipsync COMMAND...   (runs INSIDE a qube's colored frame; started for you by `miniqubes run`)
+# Shares the text clipboard between this qube and the desktop, both ways, then runs COMMAND.
+# Needs wl-clipboard in the template:  miniqubes template install alpine wl-clipboard
+# Opt a qube out: put its name in ~/.config/miniqubes/clipboard.deny (one per line).
+ME=/run/mq-clipsync
+
+if [ "$1" = "--push" ]; then            # called by wl-paste on every change; stdin = the new text
+  to=$2; f="$MQ_CLIP_STATE/in.$$"
+  cat > "$f"
+  if [ -s "$f" ] && ! cmp -s "$f" "$MQ_CLIP_STATE/last"; then
+    cp "$f" "$MQ_CLIP_STATE/last"       # remembering it stops the two sides bouncing the same text forever
+    WAYLAND_DISPLAY=$to wl-copy < "$f" >/dev/null 2>&1
+  fi
+  rm -f "$f"; exit 0
+fi
+
+HOST=mq-host
+if command -v wl-paste >/dev/null 2>&1 && command -v wl-copy >/dev/null 2>&1 \
+   && [ -n "$WAYLAND_DISPLAY" ] && [ "$WAYLAND_DISPLAY" != "$HOST" ] \
+   && [ -S "${XDG_RUNTIME_DIR:-/run/user/1000}/$HOST" ]; then
+  MQ_CLIP_STATE=$(mktemp -d /tmp/mqclip.XXXXXX) && export MQ_CLIP_STATE
+  NEST=$WAYLAND_DISPLAY
+  WAYLAND_DISPLAY=$NEST wl-paste --type text --watch "$ME" --push "$HOST" >/dev/null 2>&1 &
+  WAYLAND_DISPLAY=$HOST wl-paste --type text --watch "$ME" --push "$NEST" >/dev/null 2>&1 &
+fi
+exec "$@"

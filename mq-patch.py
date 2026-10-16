@@ -51,7 +51,7 @@ EXEC_HALF = ('    if wrap:\n        os.execvp(wrap[0], [*wrap, "bwrap", *args, *
              '    os.execvp("bwrap", ["bwrap", *args, *cmd])')
 
 
-def patch_cli(text, say):
+def patch_net(text, say):
     problems = []
     if MARK in text:
         return text, problems
@@ -82,7 +82,130 @@ def patch_cli(text, say):
     return text, problems
 
 
+CLIP_MARK = "# mq:clipboard"
+CLIP_OLD = '        cmd = ["labwc", "-S", shlex.join(cmd)]\n'
+CLIP_NEW = f'''        {CLIP_MARK}
+        # share the text clipboard with the desktop (mq-clipsync runs inside the frame); opt a qube out by
+        # listing its name in ~/.config/miniqubes/clipboard.deny
+        deny = Path(os.environ.get("MQ_CONF", Path.home() / ".config/miniqubes/boxes")).parent / "clipboard.deny"
+        try:
+            denied = a.name in deny.read_text().split()
+        except OSError:
+            denied = False
+        if not denied and Path("/usr/local/bin/mq-clipsync").exists():
+            args += ["--ro-bind", "/usr/local/bin/mq-clipsync", "/run/mq-clipsync"]
+            cmd = ["/run/mq-clipsync", *cmd]
+''' + CLIP_OLD
+
+
+CLIP_UP_OLD = "        if not denied and Path("
+CLIP_UP_NEW = '        if box.get("clipboard", True) and not denied and Path('
+
+BOX_OLD = ("    if \"frame\" in box:\n"
+           "        lines.append(f\"frame = {'true' if box['frame'] else 'false'}\")\n")
+BOX_NEW = BOX_OLD + ("    if \"clipboard\" in box:\n"
+                     "        lines.append(f\"clipboard = {'true' if box['clipboard'] else 'false'}\")\n")
+
+POP_MARK = "mq:popups"
+POP_EDITS = [
+    # first window of a qube: maximized and fixed; every later window (popups, sign-in windows) floats
+    ("        '    <windowRule identifier=\"*\"><action name=\"Maximize\"/></windowRule>\\n'\n",
+     "        '    <windowRule identifier=\"*\" matchOnce=\"true\"><fixedPosition>yes</fixedPosition>"
+     "<action name=\"Maximize\"/></windowRule>\\n'\n"
+     "        '    <windowRule type=\"dialog\"><action name=\"ToggleAlwaysOnTop\"/></windowRule>\\n'\n"),
+    ("        '  <titlebar><layout>icon:close</layout></titlebar>\\n'\n",
+     "        '  <titlebar><layout>icon:close</layout></titlebar>\\n'\n"
+     "        '  <placement><policy>center</policy></placement>\\n'\n"
+     "        '  <focus><raiseOnFocus>no</raiseOnFocus></focus>\\n'\n"),
+    # clicking inside a window no longer raises it, so the main window can't cover its own popup
+    ("        '<action name=\"Focus\"/><action name=\"Raise\"/></mousebind></context>\\n'\n",
+     "        '<action name=\"Focus\"/></mousebind></context>\\n'\n"),
+    # popups can be dragged by the title bar and resized from the edges (the main window is fixed above)
+    ("        '  </mouse>\\n'\n",
+     "        '    <!-- mq:popups -->\\n'\n"
+     "        '    <context name=\"Title\"><mousebind button=\"Left\" action=\"Press\"><action name=\"Focus\"/>"
+     "<action name=\"Raise\"/></mousebind><mousebind button=\"Left\" action=\"Drag\"><action name=\"Move\"/>"
+     "</mousebind></context>\\n'\n"
+     "        '    <context name=\"Titlebar\"><mousebind button=\"Left\" action=\"Press\"><action name=\"Focus\"/>"
+     "<action name=\"Raise\"/></mousebind><mousebind button=\"Left\" action=\"Drag\"><action name=\"Move\"/>"
+     "</mousebind></context>\\n'\n"
+     "        + ''.join(f'    <context name=\"{c}\"><mousebind button=\"Left\" action=\"Drag\"><action name=\"Resize\"/>'\n"
+     "                  '</mousebind></context>\\n' for c in ('Top', 'Bottom', 'Left', 'Right', 'TLCorner', 'TRCorner', 'BLCorner', 'BRCorner'))\n"
+     "        + '  </mouse>\\n'\n"),
+]
+
+
+CLIP_FIX = [('"/usr/local/bin/mq-clipsync", "/usr/local/bin/mq-clipsync"]', '"/usr/local/bin/mq-clipsync", "/run/mq-clipsync"]'),
+            ('cmd = ["mq-clipsync", *cmd]', 'cmd = ["/run/mq-clipsync", *cmd]')]
+
+
+def patch_clip(text, say):
+    problems = []
+    for o, n in CLIP_FIX:      # the template is read-only, so the helper must be mounted under /run (a tmpfs)
+        if o in text:
+            text = text.replace(o, n)
+            say("fixed: clipboard helper mount point")
+    if CLIP_MARK in text:
+        if CLIP_UP_OLD in text and CLIP_UP_NEW not in text:
+            text = text.replace(CLIP_UP_OLD, CLIP_UP_NEW, 1)
+            say("patched: per-qube clipboard setting")
+    elif text.count(CLIP_OLD) == 1:
+        text = text.replace(CLIP_OLD, CLIP_NEW.replace("        if not denied and Path(", CLIP_UP_NEW, 1))
+        say("patched: shared clipboard between qubes and the desktop")
+    else:
+        problems.append("shared clipboard")
+    if "clipboard" not in text.split("def write_box", 1)[-1].split("\ndef ", 1)[0]:
+        if text.count(BOX_OLD) == 1:
+            text = text.replace(BOX_OLD, BOX_NEW)
+            say("patched: qube file keeps the clipboard setting")
+        else:
+            problems.append("qube file clipboard setting")
+    if POP_MARK not in text:
+        if all(text.count(o) == 1 for o, _ in POP_EDITS):
+            for o, n in POP_EDITS:
+                text = text.replace(o, n)
+            say("patched: popups / sign-in windows open as their own floating windows")
+        else:
+            problems.append("popup windows")
+    return text, problems
+
+
+def patch_cli(text, say):
+    text, p1 = patch_net(text, say)
+    text, p2 = patch_clip(text, say)
+    return text, p1 + p2
+
+
 GUI_EDITS = [
+    ("clipboard checkbox",
+     '        self.frame.toggled.connect(self.save_settings)\n',
+     '        self.frame.toggled.connect(self.save_settings)\n'
+     '        self.clip = QCheckBox("Share clipboard with the desktop and other qubes")\n'
+     '        self.clip.setToolTip("Copy/paste text between this qube and everything else. Works for colored-frame qubes. "\n'
+     '                             "Turn off for qubes that handle passwords or anything private.")\n'
+     '        self.clip.toggled.connect(self.save_settings)\n'),
+    ("clipboard row", '        sf.addRow(self.frame)\n', '        sf.addRow(self.frame)\n        sf.addRow(self.clip)\n'),
+    ("clipboard hint",
+     '        sf.addRow(self.clip)\n',
+     '        sf.addRow(self.clip)\n'
+     '        sf.addRow(QLabel("Needs wl-clipboard in the base system: Install programs... and add  wl-clipboard"))\n'),
+    ("install hint",
+     '"For sound, include: libpulse\\nIdeas: "',
+     '"For sound, include: libpulse\\nFor copy/paste between qubes, include: wl-clipboard\\nIdeas: "'),
+    ("settings button",
+     '        lv.addWidget(bg)\n',
+     '        lv.addWidget(bg)\n'
+     '        sett = QPushButton("Desktop settings...")\n'
+     '        sett.setToolTip("Number of desktops, light/dark, bar, wallpaper, keybinds, system terminal and upgrades")\n'
+     '        sett.clicked.connect(lambda: subprocess.Popen(["mq-settings"], start_new_session=True))\n'
+     '        lv.addWidget(sett)\n'),
+    ("clipboard load",
+     '            self.frame.setChecked(bool(b.get("frame", True)))\n',
+     '            self.frame.setChecked(bool(b.get("frame", True)))\n'
+     '            self.clip.setChecked(bool(b.get("clipboard", True)))\n'),
+    ("clipboard save",
+     '        b["frame"] = self.frame.isChecked()\n',
+     '        b["frame"] = self.frame.isChecked()\n        b["clipboard"] = self.clip.isChecked()\n'),
     ("network choice widget",
      '        self.internet = QCheckBox("Internet access")\n        self.internet.toggled.connect(self.save_settings)\n',
      '        self.internet = QComboBox()\n'

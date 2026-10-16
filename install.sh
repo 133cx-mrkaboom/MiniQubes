@@ -20,7 +20,7 @@ BIN=/usr/local/bin
 TEMPLATES=/var/lib/miniqubes/templates
 SHARE=/usr/local/share/miniqubes
 SESSION_FILE=/usr/share/wayland-sessions/miniqubes.desktop
-PROGS="miniqubes miniqubes-gui mq-launcher mq-quick mq-ws mq-running mq-run mq-menu mq-tui mq-logout mq-profile miniqubes-session"
+PROGS="miniqubes miniqubes-gui mq-launcher mq-clipsync mq-settings mq-quick mq-ws mq-running mq-run mq-menu mq-tui mq-logout mq-profile miniqubes-session"
 DRY=0 NO_TEMPLATE=0 NO_DESKTOP=0 UNINSTALL=0 PURGE=0
 
 for a in "$@"; do
@@ -256,11 +256,13 @@ if (( NO_TEMPLATE )); then
   say "skipping base system (--no-template). Build it later from the app, or: miniqubes template build alpine"
 elif [ -d "$TEMPLATES/alpine" ]; then
   say "Alpine base system already exists, leaving it alone"
+  say "adding wl-clipboard to it (shared clipboard)"
+  run miniqubes template install alpine wl-clipboard || warn "couldn't add wl-clipboard; run: miniqubes template install alpine wl-clipboard"
 else
   say "building the Alpine base system (downloads ~100 MB, asks for your sudo password)"
   run miniqubes template build alpine
   say "adding the colored-window helper (labwc) and a terminal (foot) to it"
-  run miniqubes template install alpine labwc foot
+  run miniqubes template install alpine labwc foot wl-clipboard
 fi
 
 if ! (( DRY )) && ! compgen -G "$HOME/.config/miniqubes/boxes/*.toml" >/dev/null && [ -d "$TEMPLATES/alpine" ]; then

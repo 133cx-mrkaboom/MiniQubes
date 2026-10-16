@@ -168,6 +168,8 @@ def write_box(name, box):
         lines.append(f"seccomp_deny = {toml_list(box.get('seccomp_deny', []))}")
     if "frame" in box:
         lines.append(f"frame = {'true' if box['frame'] else 'false'}")
+    if "clipboard" in box:
+        lines.append(f"clipboard = {'true' if box['clipboard'] else 'false'}")
     for k in ("sound", "camera"):
         lines.append(f"{k} = {'true' if box.get(k) else 'false'}")
     lines.append(f"shares = {toml_list(box['shares'])}")
@@ -304,18 +306,26 @@ def write_frame(name, box):
         '<?xml version="1.0"?>\n<labwc_config>\n'
         '  <theme><name>mq</name><cornerRadius>0</cornerRadius></theme>\n'
         '  <titlebar><layout>icon:close</layout></titlebar>\n'
+        '  <placement><policy>center</policy></placement>\n'
+        '  <focus><raiseOnFocus>no</raiseOnFocus></focus>\n'
         '  <windowRules>\n'
-        '    <windowRule identifier="*"><action name="Maximize"/></windowRule>\n'
+        '    <windowRule identifier="*" matchOnce="true"><fixedPosition>yes</fixedPosition><action name="Maximize"/></windowRule>\n'
+        '    <windowRule type="dialog"><action name="ToggleAlwaysOnTop"/></windowRule>\n'
         '  </windowRules>\n'
         # kiosk: no default keybinds (no alt-tab, move, resize, unmaximize); no default mouse binds
         # (no titlebar double-click, no drag-to-move/resize). Only: click focuses, close button closes.
         '  <keyboard></keyboard>\n'
         '  <mouse>\n'
         '    <context name="Client"><mousebind button="Left" action="Press">'
-        '<action name="Focus"/><action name="Raise"/></mousebind></context>\n'
+        '<action name="Focus"/></mousebind></context>\n'
         '    <context name="Close"><mousebind button="Left" action="Release">'
         '<action name="Close"/></mousebind></context>\n'
-        '  </mouse>\n'
+        '    <!-- mq:popups -->\n'
+        '    <context name="Title"><mousebind button="Left" action="Press"><action name="Focus"/><action name="Raise"/></mousebind><mousebind button="Left" action="Drag"><action name="Move"/></mousebind></context>\n'
+        '    <context name="Titlebar"><mousebind button="Left" action="Press"><action name="Focus"/><action name="Raise"/></mousebind><mousebind button="Left" action="Drag"><action name="Move"/></mousebind></context>\n'
+        + ''.join(f'    <context name="{c}"><mousebind button="Left" action="Drag"><action name="Resize"/>'
+                  '</mousebind></context>\n' for c in ('Top', 'Bottom', 'Left', 'Right', 'TLCorner', 'TRCorner', 'BLCorner', 'BRCorner'))
+        + '  </mouse>\n'
         '</labwc_config>\n')
     (th / "themes/mq/labwc/themerc").write_text(
         "border.width: 4\npadding.height: 4\nwindow.label.text.justify: center\n"
@@ -428,6 +438,17 @@ def cmd_run(a):
         th = write_frame(a.name, box)
         args += ["--ro-bind", str(th / "config"), "/home/user/.config/labwc",
                  "--ro-bind", str(th / "themes"), "/home/user/.local/share/themes"]
+        # mq:clipboard
+        # share the text clipboard with the desktop (mq-clipsync runs inside the frame); opt a qube out by
+        # listing its name in ~/.config/miniqubes/clipboard.deny
+        deny = Path(os.environ.get("MQ_CONF", Path.home() / ".config/miniqubes/boxes")).parent / "clipboard.deny"
+        try:
+            denied = a.name in deny.read_text().split()
+        except OSError:
+            denied = False
+        if box.get("clipboard", True) and not denied and Path("/usr/local/bin/mq-clipsync").exists():
+            args += ["--ro-bind", "/usr/local/bin/mq-clipsync", "/run/mq-clipsync"]
+            cmd = ["/run/mq-clipsync", *cmd]
         cmd = ["labwc", "-S", shlex.join(cmd)]
 
     level = box.get("seccomp", "none")

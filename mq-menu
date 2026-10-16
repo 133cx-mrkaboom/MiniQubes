@@ -138,10 +138,12 @@ def build():
         rows.append(f"<child>{item('none', 'no qubes yet', False)}</child>")
     actions["m-search"] = "mq-launcher"
     actions["m-manage"] = "miniqubes-gui"
+    actions["m-settings"] = "mq-settings"
     sep = '<child><object class="GtkSeparatorMenuItem"><property name="visible">True</property></object></child>'
     rows.append(sep)
     rows.append(f"<child>{item('m-search', 'Search apps / run command…')}</child>")
     rows.append(f"<child>{item('m-manage', 'Manage qubes…')}</child>")
+    rows.append(f"<child>{item('m-settings', 'Desktop settings…')}</child>")
     rows.append(sep)
     power = (("p-logout", "Log out", "mq-logout"), ("p-suspend", "Suspend", "systemctl suspend"),
              ("p-reboot", "Restart", "systemctl reboot"), ("p-off", "Shut down", "systemctl poweroff"))
@@ -197,7 +199,10 @@ def main():
         now = signature()
         if now != last:
             last = now
-            build()
+            try:
+                build()
+            except Exception:
+                continue    # keep watching; try again on the next change
             subprocess.run(["pkill", "-USR2", "-x", "waybar"], check=False)   # waybar reloads its config + menu
 
 

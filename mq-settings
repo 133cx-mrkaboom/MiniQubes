@@ -1,0 +1,435 @@
+#!/usr/bin/python3
+"""mq-settings - settings for everything OUTSIDE the qubes: the desktop, the bar, the wallpaper, keybinds,
+and a confirmed way to open a normal terminal / upgrade the real system.
+
+Opened from Manage ("Desktop settings..."), the Launcher menu, or Super+comma.
+Changes are written to ~/.config/miniqubes/desktop (rc.xml, waybar.json, theme, wallpaper.*) when you press Apply,
+and the running desktop is reloaded. A backup of the old rc.xml / waybar.json is kept as *.bak-settings."""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import xml.dom.minidom
+from pathlib import Path
+from xml.sax.saxutils import escape, unescape
+
+D = Path(os.environ.get("MQ_DESKTOP", Path.home() / ".config/miniqubes/desktop"))
+RC, BAR = D / "rc.xml", D / "waybar.json"
+
+KB = re.compile(r'[ \t]*<keybind\s+key="([^"]+)"\s*>(.*?)</keybind>[ \t]*\n?', re.S)
+KEY_OK = re.compile(r"^([SCAWMH]-)*[A-Za-z0-9_]+$")
+NUM = re.compile(r"<number>\s*(\d+)\s*</number>")
+
+# (module, label, side); order here is the order on the bar. custom/launcher is always on.
+BAR_MODULES = [
+    ("custom/manage", "Manage button", "left"), ("ext/workspaces", "Workspaces", "left"),
+    ("wlr/taskbar", "Open windows", "left"),
+    ("custom/running", "Running qubes", "right"), ("network", "Wi-Fi", "right"), ("pulseaudio", "Volume", "right"),
+    ("custom/profile", "Power mode", "right"), ("battery", "Battery", "right"), ("clock", "Clock", "right"),
+    ("tray", "Tray (clipboard manager, etc.)", "right"),
+]
+
+
+# ------------------------------------------------------------------ helpers (no Qt)
+def describe(body):
+    cmd = re.search(r"<command>(.*?)</command>", body, re.S)
+    if cmd:
+        return "Run: " + unescape(cmd.group(1).strip())
+    out = []
+    for m in re.finditer(r'<action\s+name="([^"]+)"\s*(?:/>|>(.*?)</action>)', body, re.S):
+        extra = " ".join(x.strip() for x in re.findall(r">([^<>]+)<", m.group(2) or "") if x.strip())
+        out.append((m.group(1) + (" " + extra if extra else "")).strip())
+    return ", ".join(out) or "(custom)"
+
+
+def parse_binds(rc):
+    return [(m.group(1), describe(m.group(2)), m.span()) for m in KB.finditer(rc)]
+
+
+def workspaces_of(rc):
+    m = NUM.search(rc)
+    return int(m.group(1)) if m else 4
+
+
+def set_workspaces(rc, n):
+    return NUM.sub(f"<number>{n}</number>", rc, count=1) if NUM.search(rc) else rc
+
+
+def add_bind(rc, key, command):
+    line = (f'    <keybind key="{escape(key)}"><action name="Execute"><command>{escape(command)}</command>'
+            f'</action></keybind>\n')
+    i = rc.find("</keyboard>")
+    return rc[:i].rstrip(" \t") + line + "  " + rc[i:] if i >= 0 else rc
+
+
+def rename_bind(rc, span, newkey):
+    seg = rc[span[0]:span[1]]
+    return rc[:span[0]] + re.sub(r'key="[^"]+"', f'key="{escape(newkey)}"', seg, count=1) + rc[span[1]:]
+
+
+def remove_bind(rc, span):
+    return rc[:span[0]] + rc[span[1]:]
+
+
+def upgrade_command():
+    osr = {}
+    try:
+        for ln in Path("/etc/os-release").read_text().splitlines():
+            if "=" in ln:
+                k, v = ln.split("=", 1)
+                osr[k] = v.strip('"')
+    except OSError:
+        pass
+    ids = (osr.get("ID", "") + " " + osr.get("ID_LIKE", "")).split()
+    if "arch" in ids:
+        return "sudo pacman -Syu"
+    if "debian" in ids or "ubuntu" in ids:
+        return "sudo apt-get update && sudo apt-get dist-upgrade"
+    if "fedora" in ids or "rhel" in ids:
+        return "sudo dnf upgrade"
+    if any(i in ids for i in ("suse", "opensuse", "sles")):
+        return "sudo zypper dup"
+    return None
+
+
+def terminal_argv(title, script=None):
+    for t in ("foot", "alacritty", "kitty", "xterm"):
+        if not shutil.which(t):
+            continue
+        base = [t, "--title", title] if t == "kitty" else [t, "-T", title]
+        if script is None:
+            return base
+        return base + (["sh", "-c", script] if t == "kitty" else ["-e", "sh", "-c", script])
+    return None
+
+
+def backup(path):
+    if path.exists():
+        shutil.copy2(path, str(path) + ".bak-settings")
+
+
+def reload_desktop(restart_bar, restart_wall):
+    run = lambda *a: subprocess.run(a, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    run("labwc", "-r")                       # rc.xml: keybinds, workspace count
+    if restart_bar:
+        run("pkill", "-x", "waybar")         # the session's loop starts it again with the new settings
+    if restart_wall:
+        run("pkill", "-x", "swaybg")
+
+
+# ------------------------------------------------------------------ window
+def main():
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QColor
+    from PySide6.QtWidgets import (
+        QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
+        QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMessageBox, QPushButton, QSpinBox,
+        QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
+
+    app = QApplication(sys.argv)
+
+    if not RC.exists():
+        QMessageBox.critical(None, "MiniQubes settings", f"{RC} not found.\nStart the MiniQubes desktop once "
+                             "(or run: miniqubes-session --seed).")
+        return 1
+
+    class Win(QWidget):
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle("MiniQubes settings")
+            self.resize(640, 520)
+            self.rc = RC.read_text()
+            self.bar = None
+            try:
+                self.bar = json.loads(BAR.read_text())
+            except (OSError, ValueError):
+                pass
+            self.theme0 = (D / "theme").read_text().strip() if (D / "theme").exists() else "dark"
+            self.pending_wall = None      # ("file", path) | ("color", "#rrggbb") | ("clear", None)
+            tabs = QTabWidget()
+            tabs.addTab(self.system_tab(), "System")
+            tabs.addTab(self.desktop_tab(), "Desktop")
+            tabs.addTab(self.bar_tab(), "Bar")
+            tabs.addTab(self.keys_tab(), "Keybinds")
+            bb = QDialogButtonBox()
+            self.apply_btn = bb.addButton("Apply", QDialogButtonBox.AcceptRole)
+            close = bb.addButton("Close", QDialogButtonBox.RejectRole)
+            self.apply_btn.clicked.connect(self.apply)
+            close.clicked.connect(self.close)
+            v = QVBoxLayout(self)
+            v.addWidget(tabs)
+            v.addWidget(bb)
+
+        # ---- System
+        def system_tab(self):
+            w = QWidget()
+            v = QVBoxLayout(w)
+            note = QLabel("These act on the real system, outside every qube. Each one asks you to confirm first.")
+            note.setWordWrap(True)
+            v.addWidget(note)
+            t = QPushButton("Open a system terminal...")
+            t.clicked.connect(self.open_terminal)
+            self.up_cmd = upgrade_command()
+            u = QPushButton("Upgrade the system..." if self.up_cmd else "Upgrade the system (distro not recognised)")
+            u.setEnabled(bool(self.up_cmd))
+            u.clicked.connect(self.upgrade)
+            r = QPushButton("Restore desktop defaults...")
+            r.clicked.connect(self.restore)
+            for b in (t, u, r):
+                v.addWidget(b)
+            v.addStretch(1)
+            return w
+
+        def confirm(self, title, text, yes="Continue"):
+            m = QMessageBox(QMessageBox.Warning, title, text, QMessageBox.NoButton, self)
+            ok = m.addButton(yes, QMessageBox.AcceptRole)
+            m.addButton("Cancel", QMessageBox.RejectRole)
+            m.exec()
+            return m.clickedButton() is ok
+
+        def spawn(self, argv):
+            if not argv:
+                QMessageBox.warning(self, "No terminal", "Install a terminal (foot, alacritty, kitty or xterm).")
+                return
+            subprocess.Popen(argv, start_new_session=True)
+
+        def open_terminal(self):
+            if self.confirm("System terminal",
+                            "This opens a normal terminal on your real system, OUTSIDE every qube.\n"
+                            "Anything you run there can read or change everything on this computer.\n\nOpen it?",
+                            "Open terminal"):
+                self.spawn(terminal_argv("System terminal (outside the qubes)"))
+
+        def upgrade(self):
+            if self.confirm("System upgrade",
+                            f"This runs, in a terminal, with your password:\n\n    {self.up_cmd}\n\n"
+                            "Upgrades can take a while and may need a restart afterwards. Continue?", "Upgrade"):
+                self.spawn(terminal_argv("System upgrade", self.up_cmd +
+                                         "; echo; printf 'finished. press Enter to close '; read x"))
+
+        def restore(self):
+            if self.confirm("Restore defaults",
+                            "Puts the default keybinds, bar and look back.\nYour current settings are kept in "
+                            "~/.config/miniqubes/desktop.bak-DATE.", "Restore"):
+                r = subprocess.run(["miniqubes-session", "--reset", "--seed"], capture_output=True, text=True)
+                reload_desktop(True, True)
+                QMessageBox.information(self, "Restored", (r.stdout + r.stderr).strip() or "Done.")
+                self.close()
+
+        # ---- Desktop
+        def desktop_tab(self):
+            w = QWidget()
+            f = QFormLayout(w)
+            self.ws = QSpinBox()
+            self.ws.setRange(1, 9)
+            self.ws.setValue(workspaces_of(self.rc))
+            f.addRow("Number of desktops", self.ws)
+            self.theme = QComboBox()
+            self.theme.addItem("Dark", "dark")
+            self.theme.addItem("Light", "light")
+            self.theme.setCurrentIndex(1 if self.theme0 == "light" else 0)
+            f.addRow("Look", self.theme)
+            self.wall_label = QLabel(self.wall_text())
+            f.addRow("Wallpaper", self.wall_label)
+            row = QHBoxLayout()
+            for text, fn in (("Choose picture...", self.pick_wall), ("Solid color...", self.pick_color),
+                             ("Default", self.clear_wall)):
+                b = QPushButton(text)
+                b.clicked.connect(fn)
+                row.addWidget(b)
+            f.addRow("", row)
+            f.addRow(QLabel("The look changes the bar, the quick launcher and the default wallpaper color.\n"
+                            "Apps inside qubes keep their own look."))
+            return w
+
+        def wall_text(self):
+            for e in ("png", "jpg", "jpeg"):
+                if (D / f"wallpaper.{e}").exists():
+                    return f"picture (wallpaper.{e})"
+            c = (D / "wallcolor").read_text().strip() if (D / "wallcolor").exists() else ""
+            return f"solid color {c}" if c else "default color"
+
+        def pick_wall(self):
+            p, _ = QFileDialog.getOpenFileName(self, "Wallpaper (png or jpg)", str(Path.home()),
+                                               "Pictures (*.png *.jpg *.jpeg)")
+            if p:
+                self.pending_wall = ("file", p)
+                self.wall_label.setText(f"picture: {Path(p).name} (not applied yet)")
+
+        def pick_color(self):
+            c = QColorDialog.getColor(QColor("#14161c"), self, "Wallpaper color")
+            if c.isValid():
+                self.pending_wall = ("color", c.name())
+                self.wall_label.setText(f"solid color {c.name()} (not applied yet)")
+
+        def clear_wall(self):
+            self.pending_wall = ("clear", None)
+            self.wall_label.setText("default color (not applied yet)")
+
+        # ---- Bar
+        def bar_tab(self):
+            w = QWidget()
+            v = QVBoxLayout(w)
+            self.mod_boxes = {}
+            if self.bar is None:
+                v.addWidget(QLabel("waybar.json couldn't be read as plain JSON (comments in it?).\n"
+                                   "Edit it by hand: ~/.config/miniqubes/desktop/waybar.json"))
+                v.addStretch(1)
+                return w
+            have = set(self.bar.get("modules-left", [])) | set(self.bar.get("modules-right", []))
+            for mod, label, _ in BAR_MODULES:
+                cb = QCheckBox(label)
+                cb.setChecked(mod in have)
+                self.mod_boxes[mod] = cb
+                v.addWidget(cb)
+            f = QFormLayout()
+            self.pos = QComboBox()
+            self.pos.addItem("Top", "top")
+            self.pos.addItem("Bottom", "bottom")
+            self.pos.setCurrentIndex(1 if self.bar.get("position") == "bottom" else 0)
+            self.height = QSpinBox()
+            self.height.setRange(24, 60)
+            self.height.setValue(int(self.bar.get("height", 34)))
+            f.addRow("Position", self.pos)
+            f.addRow("Height", self.height)
+            v.addLayout(f)
+            v.addWidget(QLabel("The green Launcher button is always there."))
+            v.addStretch(1)
+            return w
+
+        # ---- Keybinds
+        def keys_tab(self):
+            w = QWidget()
+            v = QVBoxLayout(w)
+            v.addWidget(QLabel("Key names: W = Super, A = Alt, C = Ctrl, S = Shift.   Example:  W-S-q  =  Super+Shift+Q"))
+            self.table = QTableWidget(0, 2)
+            self.table.setHorizontalHeaderLabels(["Key", "Does"])
+            self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+            self.table.setSelectionBehavior(QTableWidget.SelectRows)
+            self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+            v.addWidget(self.table)
+            row = QHBoxLayout()
+            for text, fn in (("Add...", self.add_key), ("Change key...", self.change_key), ("Remove", self.remove_key)):
+                b = QPushButton(text)
+                b.clicked.connect(fn)
+                row.addWidget(b)
+            v.addLayout(row)
+            self.fill_keys()
+            return w
+
+        def fill_keys(self):
+            self.binds = parse_binds(self.rc)
+            self.table.setRowCount(len(self.binds))
+            for i, (k, what, _) in enumerate(self.binds):
+                self.table.setItem(i, 0, QTableWidgetItem(unescape(k)))
+                self.table.setItem(i, 1, QTableWidgetItem(what))
+
+        def sel(self):
+            r = self.table.currentRow()
+            return self.binds[r] if 0 <= r < len(self.binds) else None
+
+        def good_key(self, key, ignore=None):
+            if not KEY_OK.match(key):
+                QMessageBox.warning(self, "Key", "That isn't a valid key name. Example: W-S-q or XF86AudioMute")
+                return False
+            if any(unescape(k) == key and k != ignore for k, _, _ in self.binds):
+                QMessageBox.warning(self, "Key", f"{key} is already used.")
+                return False
+            return True
+
+        def add_key(self):
+            d = QDialog(self)
+            d.setWindowTitle("Add keybind")
+            f = QFormLayout(d)
+            k, c = QLineEdit(), QLineEdit()
+            k.setPlaceholderText("W-t")
+            c.setPlaceholderText("mq-run school -- alacritty")
+            f.addRow("Key", k)
+            f.addRow("Command", c)
+            f.addRow(QLabel("Runs on the desktop, outside qubes. To start an app in a qube:\n"
+                            "mq-run QUBE -- APP"))
+            bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            bb.accepted.connect(d.accept)
+            bb.rejected.connect(d.reject)
+            f.addRow(bb)
+            if d.exec() != QDialog.Accepted:
+                return
+            key, cmd = k.text().strip(), c.text().strip()
+            if cmd and self.good_key(key):
+                self.rc = add_bind(self.rc, key, cmd)
+                self.fill_keys()
+
+        def change_key(self):
+            s = self.sel()
+            if not s:
+                return
+            new, ok = QInputDialog.getText(self, "Change key", f"New key for:  {s[1]}", text=unescape(s[0]))
+            new = new.strip()
+            if ok and new != unescape(s[0]) and self.good_key(new, ignore=s[0]):
+                self.rc = rename_bind(self.rc, s[2], new)
+                self.fill_keys()
+
+        def remove_key(self):
+            s = self.sel()
+            if s and self.confirm("Remove keybind", f"Remove  {unescape(s[0])}  ({s[1]})?", "Remove"):
+                self.rc = remove_bind(self.rc, s[2])
+                self.fill_keys()
+
+        # ---- apply
+        def apply(self):
+            try:
+                rc = set_workspaces(self.rc, self.ws.value())
+                xml.dom.minidom.parseString(rc)
+            except Exception as e:
+                QMessageBox.critical(self, "Not applied", f"rc.xml would be invalid, nothing was changed:\n{e}")
+                return
+            changed_rc = rc != RC.read_text()
+            if changed_rc:
+                backup(RC)
+                RC.write_text(rc)
+            self.rc = rc
+            bar_changed = False
+            if self.bar is not None:
+                bar = json.loads(json.dumps(self.bar))
+                for side in ("left", "right"):
+                    key = f"modules-{side}"
+                    old = bar.get(key, [])
+                    known = [m for m, _, s in BAR_MODULES if s == side]
+                    keep = [m for m in old if m not in {x for x, _, _ in BAR_MODULES}]    # user-added modules stay
+                    head = [m for m in old if m == "custom/launcher"]
+                    bar[key] = head + [m for m in known if self.mod_boxes[m].isChecked()] + [m for m in keep if m not in head]
+                bar["position"], bar["height"] = self.pos.currentData(), self.height.value()
+                if bar != self.bar:
+                    backup(BAR)
+                    BAR.write_text(json.dumps(bar, indent=2, ensure_ascii=False) + "\n")
+                    self.bar, bar_changed = bar, True
+            theme = self.theme.currentData()
+            theme_changed = theme != self.theme0
+            if theme_changed:
+                (D / "theme").write_text(theme + "\n")
+                self.theme0 = theme
+            wall_changed = False
+            if self.pending_wall:
+                kind, val = self.pending_wall
+                for e in ("png", "jpg", "jpeg"):
+                    (D / f"wallpaper.{e}").unlink(missing_ok=True)
+                (D / "wallcolor").unlink(missing_ok=True)
+                if kind == "file":
+                    ext = Path(val).suffix.lower().lstrip(".")
+                    shutil.copy2(val, D / f"wallpaper.{'jpg' if ext == 'jpeg' else ext}")
+                elif kind == "color":
+                    (D / "wallcolor").write_text(val + "\n")
+                self.pending_wall, wall_changed = None, True
+                self.wall_label.setText(self.wall_text())
+            reload_desktop(bar_changed or theme_changed, wall_changed or theme_changed)
+            self.apply_btn.setText("Applied")
+
+    w = Win()
+    w.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
