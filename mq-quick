@@ -1,0 +1,24 @@
+#!/bin/sh
+# mq-quick - instant app picker (no Qt): type to filter "qube  ›  app", Enter starts it inside that qube.
+# Press the key again to close it. The list is written by mq-menu (apps.tsv in the desktop folder).
+D="${MQ_DESKTOP:-$HOME/.config/miniqubes/desktop}"
+TSV="$D/apps.tsv"
+
+# same key again = close it
+for m in fuzzel wofi bemenu; do pkill -x "$m" 2>/dev/null && exit 0; done
+
+[ -s "$TSV" ] || mq-menu --once >/dev/null 2>&1
+
+if command -v fuzzel >/dev/null 2>&1; then
+  set -- fuzzel --dmenu
+  [ -f "$D/fuzzel.ini" ] && set -- "$@" --config "$D/fuzzel.ini"
+elif command -v wofi >/dev/null 2>&1;   then set -- wofi --dmenu --prompt run
+elif command -v bemenu >/dev/null 2>&1; then set -- bemenu -p run
+else exec mq-launcher      # no light picker installed: fall back to the Qt one
+fi
+
+sel=$(cut -f1 "$TSV" | "$@") || exit 0
+[ -n "$sel" ] || exit 0
+cmd=$(awk -F'\t' -v l="$sel" '$1 == l { print $2; exit }' "$TSV")
+[ -n "$cmd" ] || exit 0
+setsid sh -c "$cmd" >/dev/null 2>&1 &

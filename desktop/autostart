@@ -14,5 +14,8 @@ fi
 mq-menu --once >/dev/null 2>&1
 mq-menu --daemon "$LP" >/dev/null 2>&1 &
 
+# clipboard manager (only if installed); it sits in the bar's tray, Super+V opens it
+command -v copyq >/dev/null 2>&1 && copyq --start-server >/dev/null 2>&1 &
+
 # the bar; restarts itself if it crashes, but stops when the desktop ends (so sessions never pile up bars)
 ( while kill -0 "$LP" 2>/dev/null; do waybar -c "$D/waybar.json" -s "$D/waybar.css"; sleep 1; done ) >/dev/null 2>&1 &

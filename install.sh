@@ -20,7 +20,7 @@ BIN=/usr/local/bin
 TEMPLATES=/var/lib/miniqubes/templates
 SHARE=/usr/local/share/miniqubes
 SESSION_FILE=/usr/share/wayland-sessions/miniqubes.desktop
-PROGS="miniqubes miniqubes-gui mq-launcher mq-running mq-run mq-menu mq-tui mq-logout mq-profile miniqubes-session"
+PROGS="miniqubes miniqubes-gui mq-launcher mq-quick mq-ws mq-running mq-run mq-menu mq-tui mq-logout mq-profile miniqubes-session"
 DRY=0 NO_TEMPLATE=0 NO_DESKTOP=0 UNINSTALL=0 PURGE=0
 
 for a in "$@"; do
@@ -96,7 +96,7 @@ say "detected: $DISTRO family ($(. "$OS_RELEASE"; echo "${PRETTY_NAME:-$ID}"))"
 # desktop = labwc (compositor), waybar (bar), swaybg (wallpaper), Qt Wayland plugin, a font,
 # nmtui (wi-fi screen), pulsemixer (audio screen) and power-profiles-daemon (battery menu) for the bar buttons
 ARCH_PKGS="python bubblewrap pyside6 foot"
-(( NO_DESKTOP )) || ARCH_PKGS="$ARCH_PKGS labwc waybar swaybg qt6-wayland ttf-dejavu networkmanager pulsemixer power-profiles-daemon python-gobject passt nftables"
+(( NO_DESKTOP )) || ARCH_PKGS="$ARCH_PKGS labwc waybar swaybg qt6-wayland ttf-dejavu networkmanager pulsemixer power-profiles-daemon python-gobject passt nftables copyq fuzzel"
 # installs each package on its own so one that doesn't exist on this release doesn't stop the rest
 each() { local mgr=$1; shift; local p; for p in "$@"; do run $mgr "$p" || warn "couldn't install $p"; done; }
 
@@ -132,18 +132,18 @@ case $DISTRO in
         python3-pyside6.qtcore python3-pyside6.qtgui python3-pyside6.qtwidgets \
       || warn "couldn't install PySide6 from apt (older release?); will try pip below"
     run sudo apt-get install -y foot || run sudo apt-get install -y xterm || true
-    (( NO_DESKTOP )) || each "sudo apt-get install -y" labwc waybar swaybg qt6-wayland fonts-dejavu-core network-manager pulsemixer power-profiles-daemon python3-gi passt nftables ;;
+    (( NO_DESKTOP )) || each "sudo apt-get install -y" labwc waybar swaybg qt6-wayland fonts-dejavu-core network-manager pulsemixer power-profiles-daemon python3-gi passt nftables copyq fuzzel ;;
   fedora)
     run sudo dnf install -y python3 python3-pip bubblewrap python3-pyside6 curl tar \
       || warn "couldn't install PySide6 from dnf; will try pip below"
     run sudo dnf install -y foot || run sudo dnf install -y xterm || true
-    (( NO_DESKTOP )) || each "sudo dnf install -y" labwc waybar swaybg qt6-qtwayland dejavu-sans-fonts NetworkManager-tui pulsemixer power-profiles-daemon python3-gobject passt nftables ;;
+    (( NO_DESKTOP )) || each "sudo dnf install -y" labwc waybar swaybg qt6-qtwayland dejavu-sans-fonts NetworkManager-tui pulsemixer power-profiles-daemon python3-gobject passt nftables CopyQ fuzzel ;;
   suse)
     run sudo zypper --non-interactive install python3 python3-pip bubblewrap curl tar
     run sudo zypper --non-interactive install python3-pyside6 \
       || warn "couldn't install PySide6 from zypper; will try pip below"
     run sudo zypper --non-interactive install foot || run sudo zypper --non-interactive install xterm || true
-    (( NO_DESKTOP )) || each "sudo zypper --non-interactive install" labwc waybar swaybg qt6-wayland dejavu-fonts NetworkManager pulsemixer power-profiles-daemon python3-gobject passt nftables ;;
+    (( NO_DESKTOP )) || each "sudo zypper --non-interactive install" labwc waybar swaybg qt6-wayland dejavu-fonts NetworkManager pulsemixer power-profiles-daemon python3-gobject passt nftables copyq fuzzel ;;
   nix)
     die "NixOS can't be set up by a script like this. Add python3, bubblewrap, python3Packages.pyside6, foot, labwc, waybar and swaybg to your configuration, then copy the MiniQubes files onto your PATH." ;;
   *)

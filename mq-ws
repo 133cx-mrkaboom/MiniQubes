@@ -1,0 +1,15 @@
+#!/bin/sh
+# mq-ws add|remove|count - change how many workspaces the desktop has (1-9).
+# labwc has no "add workspace" action, so this rewrites <number> in rc.xml and asks labwc to reload.
+# Windows on a removed workspace are moved to the last one that is left.
+D="${MQ_DESKTOP:-$HOME/.config/miniqubes/desktop}"
+RC="$D/rc.xml"
+n=$(sed -n 's#.*<number>\([0-9][0-9]*\)</number>.*#\1#p' "$RC" 2>/dev/null | head -n1)
+[ -n "$n" ] || { echo "mq-ws: no <number> in $RC" >&2; exit 1; }
+case "${1:-count}" in
+  add)    [ "$n" -lt 9 ] || exit 0; n=$((n + 1)) ;;
+  remove) [ "$n" -gt 1 ] || exit 0; n=$((n - 1)) ;;
+  count)  echo "$n"; exit 0 ;;
+  *) echo "usage: mq-ws add|remove|count" >&2; exit 1 ;;
+esac
+sed -i "s#<number>[0-9]*</number>#<number>$n</number>#" "$RC" && labwc -r

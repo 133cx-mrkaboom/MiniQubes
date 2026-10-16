@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 """mq-menu - builds the bar's "Launcher" dropdown: qube -> (hover) -> app.
 
-  mq-menu --once     write menu.xml + menu.json into the desktop folder
+  mq-menu --once     write menu.xml + menu.json (+ apps.tsv for mq-quick) into the desktop folder
   mq-menu --daemon [PID]   same, then keep watching: when qubes or installed apps change, rebuild and reload the bar
                            (stops by itself when process PID, the desktop, is gone)
 """
@@ -114,7 +114,7 @@ def item(iid, label, sensitive=True):
 
 def build():
     boxes = load_boxes()
-    actions, rows = {}, []
+    actions, rows, quick = {}, [], []
     for b in boxes:
         n = b["name"]
         frame = has(b["template"], "usr/bin/labwc")
@@ -123,6 +123,7 @@ def build():
         for i, (label, argv) in enumerate(apps):
             aid = f"a-{n}-{i}"
             actions[aid] = shlex.join(["mq-run", *(["--frame"] if frame else []), n, "--", *argv])
+            quick.append(f"{n}  ›  {label}".replace("\t", " ").replace("\n", " ") + "\t" + actions[aid])
             sub.append(f"<child>{item(aid, label)}</child>")
         if not sub:
             sub.append(f"<child>{item(f'none-{n}', '(no apps found in this qube)', False)}</child>")
@@ -155,8 +156,9 @@ def build():
            '<property name="visible">True</property>' + "\n".join(rows) + "</object>\n</interface>\n")
     import json
     js = json.dumps({"custom/launcher": {"menu-actions": actions}}, ensure_ascii=False, indent=1) + "\n"
+    quick.append("Manage qubes…\tminiqubes-gui")
     DESK.mkdir(parents=True, exist_ok=True)
-    for name, text in (("menu.xml", xml), ("menu.json", js)):
+    for name, text in (("menu.xml", xml), ("menu.json", js), ("apps.tsv", "\n".join(quick) + "\n")):
         tmp = DESK / (name + ".tmp")
         tmp.write_text(text)
         tmp.replace(DESK / name)
