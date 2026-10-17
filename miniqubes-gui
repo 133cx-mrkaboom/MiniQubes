@@ -102,7 +102,29 @@ def find_icon(root, name):
     if not best:
         hits = glob.glob(str(root / f"usr/share/pixmaps/{name}.*"))
         best = hits[0] if hits else None
-    return QIcon(best) if best else QIcon()
+    return QIcon(str(in_root(root, best))) if best else QIcon()
+
+
+def in_root(root, p):
+    """Follow symlinks as if `root` were / (links inside a template point at the template, not at this computer)."""
+    root, cur, hops = Path(root), Path(root), 0
+    parts = list(Path(p).relative_to(root).parts)
+    while parts:
+        part = parts.pop(0)
+        if part == "..":
+            cur = cur.parent if cur != root else cur
+            continue
+        nxt = cur / part
+        if nxt.is_symlink() and hops < 40:
+            hops += 1
+            t = os.readlink(nxt)
+            if t.startswith("/"):
+                cur, parts = root, list(Path(t).parts[1:]) + parts
+            else:
+                parts = list(Path(t).parts) + parts
+        else:
+            cur = nxt
+    return cur
 
 
 def template_apps(root):
@@ -111,7 +133,7 @@ def template_apps(root):
         cp = configparser.ConfigParser(interpolation=None, strict=False)
         cp.optionxform = str
         try:
-            cp.read(f, encoding="utf-8")
+            cp.read(in_root(root, f), encoding="utf-8")
         except Exception:
             continue
         if "Desktop Entry" not in cp:

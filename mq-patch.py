@@ -176,6 +176,9 @@ def patch_cli(text, say):
     return text, p1 + p2
 
 
+HELPER_GUI = 'def in_root(root, p):\n    """Follow symlinks as if `root` were / (links inside a template point at the template, not at this computer)."""\n    root, cur, hops = Path(root), Path(root), 0\n    parts = list(Path(p).relative_to(root).parts)\n    while parts:\n        part = parts.pop(0)\n        if part == "..":\n            cur = cur.parent if cur != root else cur\n            continue\n        nxt = cur / part\n        if nxt.is_symlink() and hops < 40:\n            hops += 1\n            t = os.readlink(nxt)\n            if t.startswith("/"):\n                cur, parts = root, list(Path(t).parts[1:]) + parts\n            else:\n                parts = list(Path(t).parts) + parts\n        else:\n            cur = nxt\n    return cur\n\n\n'
+
+
 GUI_EDITS = [
     ("clipboard checkbox",
      '        self.frame.toggled.connect(self.save_settings)\n',
@@ -199,6 +202,15 @@ GUI_EDITS = [
      '        sett.setToolTip("Number of desktops, light/dark, bar, wallpaper, keybinds, system terminal and upgrades")\n'
      '        sett.clicked.connect(lambda: subprocess.Popen(["mq-settings"], start_new_session=True))\n'
      '        lv.addWidget(sett)\n'),
+    ("template links helper",
+     'def template_apps(root):\n',
+     HELPER_GUI + 'def template_apps(root):\n'),
+    ("template links read",
+     '            cp.read(f, encoding="utf-8")\n',
+     '            cp.read(in_root(root, f), encoding="utf-8")\n'),
+    ("template links icon",
+     '    return QIcon(best) if best else QIcon()\n',
+     '    return QIcon(str(in_root(root, best))) if best else QIcon()\n'),
     ("clipboard load",
      '            self.frame.setChecked(bool(b.get("frame", True)))\n',
      '            self.frame.setChecked(bool(b.get("frame", True)))\n'

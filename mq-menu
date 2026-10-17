@@ -48,6 +48,28 @@ def codes(m):
     return "%" if m.group(1) == "%" else ""
 
 
+def in_root(root, p):
+    """Follow symlinks as if `root` were / (links inside a template point at the template, not at this computer)."""
+    root, cur, hops = Path(root), Path(root), 0
+    parts = list(Path(p).relative_to(root).parts)
+    while parts:
+        part = parts.pop(0)
+        if part == "..":
+            cur = cur.parent if cur != root else cur
+            continue
+        nxt = cur / part
+        if nxt.is_symlink() and hops < 40:
+            hops += 1
+            t = os.readlink(nxt)
+            if t.startswith("/"):
+                cur, parts = root, list(Path(t).parts[1:]) + parts
+            else:
+                parts = list(Path(t).parts) + parts
+        else:
+            cur = nxt
+    return cur
+
+
 def desktop_apps(t):
     apps, term = [], terminal_cmd(t)
     for d in APP_DIRS:
@@ -57,7 +79,7 @@ def desktop_apps(t):
             continue
         for f in files:
             try:
-                lines = f.read_text(errors="replace").splitlines()
+                lines = in_root(TEMPLATES / t, f).read_text(errors="replace").splitlines()
             except OSError:
                 continue
             ent, inside = {}, False
@@ -104,7 +126,7 @@ def apps_for(box):
         if tuple(argv) not in seen:
             seen.add(tuple(argv))
             items.append((label, argv))
-    return items[:60]
+    return items      # no cap: a template with LibreOffice etc. has well over 60 entries
 
 
 def item(iid, label, sensitive=True):
