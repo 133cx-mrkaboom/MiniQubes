@@ -336,6 +336,45 @@ def write_frame(name, box):
     return th
 
 
+# mq:usb  (USB drive for ONE qube; set up in Manage > USB drives, stored in ~/.config/miniqubes/usb.toml)
+def mountpoint_of(dev):
+    try:
+        lines = Path("/proc/self/mountinfo").read_text().splitlines()
+    except OSError:
+        return None
+    for ln in lines:
+        left, _, right = ln.partition(" - ")
+        f, r = left.split(), right.split()
+        if len(r) >= 2 and r[1] == dev:
+            return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), f[4])
+    return None
+
+
+def usb_mount_for(name, conf=None, bydev="/dev/disk/by-uuid"):
+    """(mount point, read_only) of the USB drive given to this qube, or None. Only the ONE 'active' qube gets it."""
+    try:
+        cfg = tomllib.loads((conf or CONF.parent / "usb.toml").read_text())
+    except (OSError, ValueError):
+        return None
+    for uuid, d in cfg.get("drive", {}).items():
+        if d.get("active") != name or name not in d.get("allowed", []):
+            continue
+        dev = Path(bydev) / uuid
+        if not dev.exists():
+            continue                          # unplugged
+        real = str(dev.resolve())
+        mp = mountpoint_of(real)
+        if not mp:                            # replugged: mount it again (no root needed with udisks)
+            try:
+                subprocess.run(["udisksctl", "mount", "-b", real], capture_output=True, timeout=30)
+            except (OSError, subprocess.SubprocessError):
+                pass
+            mp = mountpoint_of(real)
+        if mp and Path(mp).is_dir():
+            return mp, bool(d.get("readonly"))
+    return None
+
+
 def cmd_run(a):
     box = load_box(a.name)
     check_network(box["network"])
@@ -412,6 +451,10 @@ def cmd_run(a):
             name, n = f"{base}-{n}", n + 1
         used.add(name)
         args += [flag, path, f"/home/user/Shared/{name}"]
+
+    usb = usb_mount_for(a.name)
+    if usb:
+        args += ["--ro-bind" if usb[1] else "--bind", usb[0], "/home/user/USB"]
 
     if box["network"] == "direct":
         args += ["--share-net", "--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf"]

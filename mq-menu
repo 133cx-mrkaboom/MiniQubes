@@ -161,11 +161,13 @@ def build():
     actions["m-search"] = "mq-launcher"
     actions["m-manage"] = "miniqubes-gui"
     actions["m-settings"] = "mq-settings"
+    actions["m-usb"] = "mq-usb"
     sep = '<child><object class="GtkSeparatorMenuItem"><property name="visible">True</property></object></child>'
     rows.append(sep)
     rows.append(f"<child>{item('m-search', 'Search apps / run command…')}</child>")
     rows.append(f"<child>{item('m-manage', 'Manage qubes…')}</child>")
     rows.append(f"<child>{item('m-settings', 'Desktop settings…')}</child>")
+    rows.append(f"<child>{item('m-usb', 'USB drives…')}</child>")
     rows.append(sep)
     power = (("p-logout", "Log out", "mq-logout"), ("p-suspend", "Suspend", "systemctl suspend"),
              ("p-reboot", "Restart", "systemctl reboot"), ("p-off", "Shut down", "systemctl poweroff"))

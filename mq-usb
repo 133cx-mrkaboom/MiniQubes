@@ -1,0 +1,365 @@
+#!/usr/bin/python3
+"""mq-usb - let ONE qube at a time use a USB drive.   (Manage > "USB drives...", or the Launcher menu)
+
+How it works
+  * You pick a plugged-in drive and ONE qube. The drive is mounted on your computer and shows up inside that qube
+    as ~/USB the next time an app is started in it. No other qube can see it.
+  * Switching to another qube (or detaching) closes the old qube's running apps first, so the drive is never
+    shared by two qubes at once.
+  * "Allowed qubes" is the list of qubes that may be given this drive; the choice is remembered per drive in
+    ~/.config/miniqubes/usb.toml, so plugging the same drive in later reconnects it to the same qube.
+Needs: udisks2 (mounts without root) and lsblk (util-linux)."""
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+CONF = Path(os.environ.get("MQ_CONF", Path.home() / ".config/miniqubes/boxes"))
+USB = CONF.parent / "usb.toml"
+SYSTEM_MOUNTS = {"/", "/boot", "/boot/efi", "/efi", "/home", "/usr", "/var", "/nix"}
+SKIP_FS = {"crypto_LUKS", "swap", "LVM2_member", "linux_raid_member", "zfs_member"}
+
+
+# ------------------------------------------------------------------ logic (no Qt)
+def qubes():
+    return sorted(p.stem for p in CONF.glob("*.toml")) if CONF.is_dir() else []
+
+
+def load():
+    import tomllib
+    try:
+        return dict(tomllib.loads(USB.read_text()).get("drive", {}))
+    except (OSError, ValueError):
+        return {}
+
+
+def save(cfg):
+    lines = ["# written by mq-usb. Only the 'active' qube gets the drive (at ~/USB), and only if it is in 'allowed'.", ""]
+    for uuid, d in sorted(cfg.items()):
+        lines += [f"[drive.{json.dumps(uuid)}]",
+                  f"name = {json.dumps(d.get('name', ''))}",
+                  f"allowed = {json.dumps(sorted(d.get('allowed', [])))}",
+                  f"active = {json.dumps(d.get('active', ''))}",
+                  f"readonly = {'true' if d.get('readonly') else 'false'}", ""]
+    USB.parent.mkdir(parents=True, exist_ok=True)
+    tmp = USB.with_name(USB.name + ".tmp")
+    tmp.write_text("\n".join(lines))
+    tmp.replace(USB)
+
+
+def truthy(v):
+    return v in (True, 1, "1", "true")
+
+
+def human(n):
+    n = float(n or 0)
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1000 or u == "TB":
+            return f"{n:.0f} {u}" if u == "B" else f"{n:.1f} {u}"
+        n /= 1000
+
+
+def drives():
+    """Plugged-in removable drives that have a file system (and are not part of the running system)."""
+    r = subprocess.run(["lsblk", "-J", "-b", "-o", "PATH,LABEL,UUID,SIZE,FSTYPE,HOTPLUG,RM,TYPE,MOUNTPOINT,MODEL"],
+                       capture_output=True, text=True)
+    try:
+        tree = json.loads(r.stdout)["blockdevices"]
+    except (ValueError, KeyError):
+        return []
+    out = []
+
+    def walk(node, removable, disk, model):
+        removable = removable or truthy(node.get("hotplug")) or truthy(node.get("rm"))
+        if node.get("type") == "disk":
+            disk, model = node["path"], (node.get("model") or "").strip()
+        if (removable and node.get("uuid") and node.get("fstype") and node.get("type") in ("part", "disk")
+                and node.get("fstype") not in SKIP_FS and node.get("mountpoint") not in SYSTEM_MOUNTS):
+            name = node.get("label") or model or "USB drive"
+            out.append({"dev": node["path"], "uuid": node["uuid"], "name": name, "size": node.get("size"),
+                        "fstype": node["fstype"], "disk": disk, "mount": node.get("mountpoint")})
+        for c in node.get("children", []) or []:
+            walk(c, removable, disk, model)
+
+    for n in tree:
+        walk(n, False, n.get("path"), "")
+    return out
+
+
+def mountpoint_of(dev):
+    try:
+        lines = Path("/proc/self/mountinfo").read_text().splitlines()
+    except OSError:
+        return None
+    for ln in lines:
+        left, _, right = ln.partition(" - ")
+        f, r = left.split(), right.split()
+        if len(r) >= 2 and r[1] == dev:
+            return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), f[4])
+    return None
+
+
+def udisks(*args):
+    try:
+        r = subprocess.run(["udisksctl", *args], capture_output=True, text=True, timeout=60)
+    except FileNotFoundError:
+        return False, "udisksctl not found: install the package  udisks2"
+    except subprocess.TimeoutExpired:
+        return False, "timed out"
+    return r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+def ensure_mount(dev):
+    if mountpoint_of(dev):
+        return True, ""
+    return udisks("mount", "-b", dev)
+
+
+def qube_pids(name):
+    pids = []
+    for d in os.scandir("/proc"):
+        if not d.name.isdigit():
+            continue
+        try:
+            if Path(d.path, "comm").read_text().strip() != "bwrap":
+                continue
+            argv = Path(d.path, "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        for i, a in enumerate(argv[:-2]):
+            if a == b"--setenv" and argv[i + 1] == b"MQ_BOX" and argv[i + 2].decode() == name:
+                pids.append(int(d.name))
+                break
+    return pids
+
+
+def close_qube(name):
+    """Stop every running app of a qube (they would otherwise keep holding the drive). Returns how many were closed."""
+    pids = qube_pids(name)
+    for p in pids:
+        try:
+            os.kill(p, signal.SIGTERM)
+        except OSError:
+            pass
+    for _ in range(30):
+        if not any(Path(f"/proc/{p}").exists() for p in pids):
+            break
+        time.sleep(0.1)
+    return len(pids)
+
+
+def attach(drive, qube, readonly):
+    cfg = load()
+    d = cfg.setdefault(drive["uuid"], {"allowed": [], "active": "", "readonly": False})
+    closed = 0
+    if d.get("active") and d["active"] != qube:
+        closed = close_qube(d["active"])          # the old qube must let go first: one qube at a time
+    d.update(name=drive["name"], active=qube, readonly=bool(readonly))
+    d["allowed"] = sorted(set(d.get("allowed", [])) | {qube})
+    save(cfg)
+    ok, msg = ensure_mount(drive["dev"])
+    return ok, msg, closed
+
+
+def detach(drive, power_off=False):
+    cfg = load()
+    d = cfg.get(drive["uuid"], {})
+    closed = close_qube(d["active"]) if d.get("active") else 0
+    if d:
+        d["active"] = ""
+        save(cfg)
+    msgs = []
+    if mountpoint_of(drive["dev"]):
+        ok, msg = udisks("unmount", "-b", drive["dev"])
+        if not ok:
+            msgs.append(msg)
+    if power_off and not msgs:
+        ok, msg = udisks("power-off", "-b", drive["disk"])
+        if not ok:
+            msgs.append(msg)
+    return not msgs, "\n".join(msgs), closed
+
+
+def set_allowed(drive, allowed):
+    cfg = load()
+    d = cfg.setdefault(drive["uuid"], {"allowed": [], "active": "", "readonly": False})
+    d["name"] = drive["name"]
+    d["allowed"] = sorted(allowed)
+    closed = 0
+    if d.get("active") and d["active"] not in allowed:
+        closed = close_qube(d["active"])
+        d["active"] = ""
+    save(cfg)
+    return closed
+
+
+# ------------------------------------------------------------------ window
+def main():
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import (
+        QApplication, QCheckBox, QDialog, QDialogButtonBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
+        QMessageBox, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
+
+    app = QApplication(sys.argv)
+
+    class Win(QWidget):
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle("USB drives")
+            self.resize(720, 400)
+            self.drives = []
+            note = QLabel("Only ONE qube can use a drive at a time, and it appears inside that qube as  ~/USB.\n"
+                          "Apps that were already open in the qube don't see it: start them again.")
+            note.setWordWrap(True)
+            self.table = QTableWidget(0, 4)
+            self.table.setHorizontalHeaderLabels(["Drive", "Size", "Allowed qubes", "Used by"])
+            self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+            self.table.setSelectionBehavior(QTableWidget.SelectRows)
+            self.table.setSelectionMode(QTableWidget.SingleSelection)
+            self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+            row = QHBoxLayout()
+            for text, fn in (("Attach to a qube...", self.do_attach), ("Allowed qubes...", self.do_allowed),
+                             ("Detach", self.do_detach), ("Safely remove", self.do_remove)):
+                b = QPushButton(text)
+                b.clicked.connect(fn)
+                row.addWidget(b)
+            self.empty = QLabel("")
+            v = QVBoxLayout(self)
+            v.addWidget(note)
+            v.addWidget(self.table, 1)
+            v.addWidget(self.empty)
+            v.addLayout(row)
+            self.refresh()
+            t = QTimer(self)
+            t.timeout.connect(self.refresh)
+            t.start(3000)
+
+        def refresh(self):
+            keep = self.current_uuid()
+            self.drives = drives()
+            cfg = load()
+            self.table.setRowCount(len(self.drives))
+            for i, d in enumerate(self.drives):
+                c = cfg.get(d["uuid"], {})
+                used = c.get("active") or "-"
+                if used != "-" and c.get("readonly"):
+                    used += "  (read-only)"
+                for j, text in enumerate((f"{d['name']}   [{d['fstype']}, {d['dev']}]", human(d["size"]),
+                                          ", ".join(c.get("allowed", [])) or "-", used)):
+                    self.table.setItem(i, j, QTableWidgetItem(text))
+                if d["uuid"] == keep:
+                    self.table.selectRow(i)
+            self.empty.setText("" if self.drives else "No USB drive found. Plug one in (it needs a file system on it).")
+
+        def current_uuid(self):
+            r = self.table.currentRow()
+            return self.drives[r]["uuid"] if 0 <= r < len(self.drives) else None
+
+        def sel(self):
+            r = self.table.currentRow()
+            if 0 <= r < len(self.drives):
+                return self.drives[r]
+            QMessageBox.information(self, "USB drives", "Click a drive in the list first.")
+            return None
+
+        def do_attach(self):
+            d = self.sel()
+            if not d:
+                return
+            names = qubes()
+            if not names:
+                QMessageBox.information(self, "USB drives", "Make a qube first.")
+                return
+            cfg = load().get(d["uuid"], {})
+            names.sort(key=lambda n: (n not in cfg.get("allowed", []), n))      # allowed ones first
+            qube, ok = QInputDialog.getItem(self, "Attach drive", f"Which qube gets  {d['name']}?", names, 0, False)
+            if not ok:
+                return
+            box = QMessageBox(QMessageBox.Warning, "Plug a USB drive into a qube",
+                              f"Give  {qube}  access to  {d['name']}?\n\n"
+                              f"- {qube} can read AND change everything on the drive, and anything on it can be "
+                              "malware. Only use drives you trust.\n"
+                              "- Your computer itself reads the drive's file system to mount it. A booby-trapped drive "
+                              "can attack that step, so only plug in drives you trust.\n"
+                              "- Only this one qube gets it. Switching to another qube closes this qube's running apps.",
+                              QMessageBox.NoButton, self)
+            ro = QCheckBox("Read-only (the qube can look but not change anything)")
+            box.setCheckBox(ro)
+            go = box.addButton("Attach", QMessageBox.AcceptRole)
+            box.addButton("Cancel", QMessageBox.RejectRole)
+            box.exec()
+            if box.clickedButton() is not go:
+                return
+            old = cfg.get("active")
+            if old and old != qube and qube_pids(old):
+                if QMessageBox.question(self, "Switch qube", f"{old} is using this drive. Switching closes all running "
+                                        f"apps in {old}. Continue?") != QMessageBox.Yes:
+                    return
+            ok, msg, closed = attach(d, qube, ro.isChecked())
+            text = f"{d['name']} is now for {qube} only.\nApps you start in {qube} will see it as  ~/USB."
+            if closed:
+                text += f"\nClosed {closed} running process(es) in {old}."
+            if not ok:
+                text += f"\n\nBut mounting it failed:\n{msg}"
+            QMessageBox.information(self, "USB drives", text)
+            self.refresh()
+
+        def do_allowed(self):
+            d = self.sel()
+            if not d:
+                return
+            cfg = load().get(d["uuid"], {})
+            dlg = QDialog(self)
+            dlg.setWindowTitle("Allowed qubes")
+            v = QVBoxLayout(dlg)
+            v.addWidget(QLabel(f"Qubes that may be given  {d['name']}:\n(only one at a time actually gets it)"))
+            boxes = []
+            for n in qubes():
+                cb = QCheckBox(n)
+                cb.setChecked(n in cfg.get("allowed", []))
+                boxes.append(cb)
+                v.addWidget(cb)
+            bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            bb.accepted.connect(dlg.accept)
+            bb.rejected.connect(dlg.reject)
+            v.addWidget(bb)
+            if dlg.exec() != QDialog.Accepted:
+                return
+            closed = set_allowed(d, [b.text() for b in boxes if b.isChecked()])
+            if closed:
+                QMessageBox.information(self, "USB drives", "The qube that was using it is no longer allowed: "
+                                        f"closed {closed} running process(es) and detached the drive.")
+            self.refresh()
+
+        def confirm_close(self, d, what):
+            used = load().get(d["uuid"], {}).get("active")
+            if used and qube_pids(used):
+                return QMessageBox.question(self, what, f"This closes all running apps in {used}. Continue?") \
+                    == QMessageBox.Yes
+            return True
+
+        def do_detach(self, power_off=False):
+            d = self.sel()
+            if not d or not self.confirm_close(d, "Detach"):
+                return
+            ok, msg, closed = detach(d, power_off)
+            if not ok:
+                QMessageBox.warning(self, "USB drives", f"Couldn't finish:\n{msg}")
+            elif power_off:
+                QMessageBox.information(self, "USB drives", "Safe to unplug.")
+            self.refresh()
+
+        def do_remove(self):
+            self.do_detach(power_off=True)
+
+    w = Win()
+    w.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -377,6 +377,10 @@ class Main(QMainWindow):
         sett.setToolTip("Number of desktops, light/dark, bar, wallpaper, keybinds, system terminal and upgrades")
         sett.clicked.connect(lambda: subprocess.Popen(["mq-settings"], start_new_session=True))
         lv.addWidget(sett)
+        usbb = QPushButton("USB drives...")
+        usbb.setToolTip("Give one qube at a time access to a plugged-in USB drive")
+        usbb.clicked.connect(lambda: subprocess.Popen(["mq-usb"], start_new_session=True))
+        lv.addWidget(usbb)
 
         self.reaper = QTimer(self)
         self.reaper.timeout.connect(self.reap)

@@ -170,10 +170,70 @@ def patch_clip(text, say):
     return text, problems
 
 
+USB_MARK = "# mq:usb"
+USB_HELPER = '''# mq:usb  (USB drive for ONE qube; set up in Manage > USB drives, stored in ~/.config/miniqubes/usb.toml)
+def mountpoint_of(dev):
+    try:
+        lines = Path("/proc/self/mountinfo").read_text().splitlines()
+    except OSError:
+        return None
+    for ln in lines:
+        left, _, right = ln.partition(" - ")
+        f, r = left.split(), right.split()
+        if len(r) >= 2 and r[1] == dev:
+            return re.sub(r"\\\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), f[4])
+    return None
+
+
+def usb_mount_for(name, conf=None, bydev="/dev/disk/by-uuid"):
+    """(mount point, read_only) of the USB drive given to this qube, or None. Only the ONE 'active' qube gets it."""
+    try:
+        cfg = tomllib.loads((conf or CONF.parent / "usb.toml").read_text())
+    except (OSError, ValueError):
+        return None
+    for uuid, d in cfg.get("drive", {}).items():
+        if d.get("active") != name or name not in d.get("allowed", []):
+            continue
+        dev = Path(bydev) / uuid
+        if not dev.exists():
+            continue                          # unplugged
+        real = str(dev.resolve())
+        mp = mountpoint_of(real)
+        if not mp:                            # replugged: mount it again (no root needed with udisks)
+            try:
+                subprocess.run(["udisksctl", "mount", "-b", real], capture_output=True, timeout=30)
+            except (OSError, subprocess.SubprocessError):
+                pass
+            mp = mountpoint_of(real)
+        if mp and Path(mp).is_dir():
+            return mp, bool(d.get("readonly"))
+    return None
+
+
+'''
+USB_RUN_OLD = '    if box["network"] == "direct":\n'
+USB_RUN_NEW = '''    usb = usb_mount_for(a.name)
+    if usb:
+        args += ["--ro-bind" if usb[1] else "--bind", usb[0], "/home/user/USB"]
+
+''' + USB_RUN_OLD
+USB_DEF_OLD = "def cmd_run(a):\n"
+
+
+def patch_usb(text, say):
+    if USB_MARK in text:
+        return text, []
+    if text.count(USB_RUN_OLD) != 1 or text.count(USB_DEF_OLD) != 1:
+        return text, ["USB drive for one qube"]
+    say("patched: USB drive for one qube")
+    return text.replace(USB_DEF_OLD, USB_HELPER + USB_DEF_OLD).replace(USB_RUN_OLD, USB_RUN_NEW), []
+
+
 def patch_cli(text, say):
     text, p1 = patch_net(text, say)
     text, p2 = patch_clip(text, say)
-    return text, p1 + p2
+    text, p3 = patch_usb(text, say)
+    return text, p1 + p2 + p3
 
 
 HELPER_GUI = 'def in_root(root, p):\n    """Follow symlinks as if `root` were / (links inside a template point at the template, not at this computer)."""\n    root, cur, hops = Path(root), Path(root), 0\n    parts = list(Path(p).relative_to(root).parts)\n    while parts:\n        part = parts.pop(0)\n        if part == "..":\n            cur = cur.parent if cur != root else cur\n            continue\n        nxt = cur / part\n        if nxt.is_symlink() and hops < 40:\n            hops += 1\n            t = os.readlink(nxt)\n            if t.startswith("/"):\n                cur, parts = root, list(Path(t).parts[1:]) + parts\n            else:\n                parts = list(Path(t).parts) + parts\n        else:\n            cur = nxt\n    return cur\n\n\n'
@@ -211,6 +271,13 @@ GUI_EDITS = [
     ("template links icon",
      '    return QIcon(best) if best else QIcon()\n',
      '    return QIcon(str(in_root(root, best))) if best else QIcon()\n'),
+    ("usb button",
+     '        lv.addWidget(sett)\n',
+     '        lv.addWidget(sett)\n'
+     '        usbb = QPushButton("USB drives...")\n'
+     '        usbb.setToolTip("Give one qube at a time access to a plugged-in USB drive")\n'
+     '        usbb.clicked.connect(lambda: subprocess.Popen(["mq-usb"], start_new_session=True))\n'
+     '        lv.addWidget(usbb)\n'),
     ("clipboard load",
      '            self.frame.setChecked(bool(b.get("frame", True)))\n',
      '            self.frame.setChecked(bool(b.get("frame", True)))\n'
