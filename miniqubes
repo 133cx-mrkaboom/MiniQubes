@@ -590,7 +590,7 @@ def build_alpine(dest):
         urllib.request.urlretrieve(f"{base}/releases/x86_64/{m.group(0)}", tar)
         subprocess.run(["tar", "-xzf", str(tar), "-C", str(dest)], check=True)
     (dest / "etc/apk/repositories").write_text(f"{base}/main\n{base}/community\n")
-    with_chroot(dest, "apk update && apk add firefox mesa-dri-gallium mesa-egl font-dejavu ca-certificates libpulse "
+    with_chroot(dest, "apk update && apk add firefox mesa-dri-gallium mesa-egl font-dejavu ca-certificates libpulse labwc foot wl-clipboard "
                       "&& adduser -D -s /bin/ash -u 1000 user")
 
 
@@ -599,7 +599,7 @@ def build_arch(dest):
         die("building the arch template needs an Arch host with arch-install-scripts.\n"
             "on other distros build it elsewhere and use: miniqubes template import arch <dir>")
     dest.mkdir(parents=True)
-    subprocess.run(["pacstrap", "-K", str(dest), "base", "firefox", "mesa", "ttf-dejavu"], check=True)
+    subprocess.run(["pacstrap", "-K", str(dest), "base", "firefox", "mesa", "ttf-dejavu", "labwc", "foot", "wl-clipboard", "libpulse"], check=True)
     with_chroot(dest, "useradd -m -u 1000 -s /bin/bash user")
 
 
@@ -614,16 +614,19 @@ def cmd_tlist(a):
 
 def cmd_tbuild(a):
     need_root()
-    dest = TEMPLATES / a.name
+    name = a.as_name or a.name
+    if not NAME_RE.match(name):
+        die("template name: lowercase letters, digits, - and _ (max 32)")
+    dest = TEMPLATES / name
     if dest.exists():
-        die(f"template '{a.name}' already exists (delete {dest} to rebuild)")
+        die(f"template '{name}' already exists (delete {dest} to rebuild)")
     TEMPLATES.mkdir(parents=True, exist_ok=True)
     try:
         {"alpine": build_alpine, "arch": build_arch}[a.name](dest)
     except BaseException:
         shutil.rmtree(dest, ignore_errors=True)
         raise
-    print(f"template '{a.name}' ready")
+    print(f"template '{dest.name}' ready")
 
 
 def cmd_timport(a):
@@ -663,6 +666,59 @@ def cmd_tupdate(a):
     if not root.is_dir():
         die(f"no template '{a.name}'")
     with_chroot(root, "apk update && apk upgrade" if pkg_manager(root) == "apk" else "pacman -Syu --noconfirm")
+
+
+# mq:templates  (own templates: build alpine/arch under a name, clone, delete)
+def user_conf():
+    # under sudo the boxes folder is the invoking user's, not root's
+    u = os.environ.get("SUDO_USER")
+    if os.geteuid() == 0 and u and "MQ_CONF" not in os.environ:
+        import pwd
+        return Path(pwd.getpwnam(u).pw_dir) / ".config/miniqubes/boxes"
+    return CONF
+
+
+def boxes_using(template):
+    out = []
+    for p in sorted(user_conf().glob("*.toml")):
+        try:
+            if tomllib.loads(p.read_text()).get("template") == template:
+                out.append(p.stem)
+        except (OSError, ValueError):
+            pass
+    return out
+
+
+def cmd_tclone(a):
+    need_root()
+    if not NAME_RE.match(a.new):
+        die("template name: lowercase letters, digits, - and _ (max 32)")
+    src, dest = TEMPLATES / a.name, TEMPLATES / a.new
+    if not src.is_dir():
+        die(f"no template '{a.name}'")
+    if dest.exists():
+        die(f"template '{a.new}' already exists")
+    print(f"copying {a.name} -> {a.new} (this can take a minute) ...")
+    try:
+        subprocess.run(["cp", "-a", "--reflink=auto", str(src), str(dest)], check=True)
+    except BaseException:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
+    print(f"template '{a.new}' ready. It is separate from '{a.name}': programs installed in one are not in the other.")
+
+
+def cmd_tdelete(a):
+    need_root()
+    root = TEMPLATES / a.name
+    if not root.is_dir():
+        die(f"no template '{a.name}'")
+    users = boxes_using(a.name)
+    if users:
+        die(f"template '{a.name}' is used by: {', '.join(users)}. Move those qubes to another template first.")
+    if not a.yes and input(f"delete template '{a.name}'? type its name to confirm: ") != a.name:
+        die("cancelled")
+    shutil.rmtree(root)
+    print(f"deleted template '{a.name}'")
 
 
 # ---------------------------------------------------------------- cli
@@ -715,11 +771,15 @@ def main():
     t = sub.add_parser("template", help="manage templates (admin, uses sudo)")
     ts = t.add_subparsers(dest="tcmd", required=True)
     ts.add_parser("list").set_defaults(fn=cmd_tlist)
-    s = ts.add_parser("build"); s.add_argument("name", choices=["alpine", "arch"]); s.set_defaults(fn=cmd_tbuild)
+    s = ts.add_parser("build"); s.add_argument("name", choices=["alpine", "arch"])
+    s.add_argument("--as", dest="as_name", metavar="NAME", help="save it under this template name (default: alpine / arch)")
+    s.set_defaults(fn=cmd_tbuild)
     s = ts.add_parser("import"); s.add_argument("name"); s.add_argument("dir"); s.set_defaults(fn=cmd_timport)
     s = ts.add_parser("install"); s.add_argument("name"); s.add_argument("packages", nargs="+"); s.set_defaults(fn=cmd_tinstall)
     s = ts.add_parser("update"); s.add_argument("name"); s.set_defaults(fn=cmd_tupdate)
     s = ts.add_parser("shell"); s.add_argument("name"); s.set_defaults(fn=cmd_tshell)
+    s = ts.add_parser("clone", help="copy a template under a new name"); s.add_argument("name"); s.add_argument("new"); s.set_defaults(fn=cmd_tclone)
+    s = ts.add_parser("delete", help="delete a template nothing uses"); s.add_argument("name"); s.add_argument("--yes", action="store_true"); s.set_defaults(fn=cmd_tdelete)
 
     a = ap.parse_args()
     a.fn(a)

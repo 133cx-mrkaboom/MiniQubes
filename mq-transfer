@@ -1,0 +1,482 @@
+#!/usr/bin/python3
+"""mq-transfer - take your qubes with you: export them to ONE file (e.g. on a USB stick) and import them on another PC.
+
+  mq-transfer                         window (Manage > "Export / import qubes...")
+  mq-transfer export [-o FILE] [--no-files] [--encrypt] NAME...
+  mq-transfer import FILE [--only NAME] [--as NEWNAME] [--replace]
+
+What goes in the file: each qube's settings and its saved files (its home folder; caches left out).
+What does NOT: templates (the base systems: build/copy them on the new PC, qubes just need one with the same name).
+Encrypt it (passphrase, gpg) if the file will be carried around: it holds everything saved in those qubes.
+On import, for safety: folder shares are dropped, and sound/camera are turned off. Turn them on again in Manage."""
+import argparse
+import getpass
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tarfile
+import time
+import tomllib
+from pathlib import Path
+
+HOME_DIR_NAME = "home"
+
+
+class Problem(Exception):
+    pass
+
+
+def load_cli():
+    path = shutil.which("miniqubes")
+    if not path:
+        raise Problem("`miniqubes` isn't in PATH")
+    loader = importlib.machinery.SourceFileLoader("mq", path)
+    spec = importlib.util.spec_from_loader("mq", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def running_apps(name):
+    n = 0
+    for d in os.scandir("/proc"):
+        if not d.name.isdigit():
+            continue
+        try:
+            if Path(d.path, "comm").read_text().strip() != "bwrap":
+                continue
+            argv = Path(d.path, "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        for i, a in enumerate(argv[:-2]):
+            if a == b"--setenv" and argv[i + 1] == b"MQ_BOX" and argv[i + 2].decode() == name:
+                n += 1
+                break
+    return n
+
+
+def dir_size(p):
+    total = 0
+    for root, _, files in os.walk(p):
+        for f in files:
+            try:
+                total += os.lstat(os.path.join(root, f)).st_size
+            except OSError:
+                pass
+    return total
+
+
+# ------------------------------------------------------------------ gpg (optional passphrase encryption)
+def gpg_cmd(mode, passphrase, out_path=None, in_path=None):
+    r, w = os.pipe()
+    os.write(w, passphrase.encode() + b"\n")
+    os.close(w)
+    cmd = ["gpg", "--batch", "--yes", "--quiet", "--pinentry-mode", "loopback", "--passphrase-fd", str(r)]
+    if mode == "enc":
+        cmd += ["--symmetric", "--cipher-algo", "AES256", "-o", out_path]
+    else:
+        cmd += ["--decrypt"]
+        if in_path:
+            cmd += [in_path]
+    return cmd, r
+
+
+def is_encrypted(path):
+    with open(path, "rb") as f:
+        return f.read(2) != b"\x1f\x8b"
+
+
+# ------------------------------------------------------------------ export
+def export_qubes(mq, names, out, include_files=True, passphrase=None):
+    out = Path(out)
+    qubes = []
+    for n in names:
+        if not (mq.CONF / f"{n}.toml").exists():
+            raise Problem(f"no qube called {n}")
+        c = running_apps(n)
+        if include_files and c:
+            raise Problem(f"{n} has apps running. Close them first so its files are saved in one piece.")
+        home = mq.DATA / n / HOME_DIR_NAME
+        qubes.append({"name": n, "files": bool(include_files and home.is_dir()),
+                      "bytes": dir_size(home) if include_files and home.is_dir() else 0,
+                      "template": tomllib.loads((mq.CONF / f"{n}.toml").read_text()).get("template", "")})
+    manifest = json.dumps({"format": 1, "created": time.strftime("%Y-%m-%d %H:%M:%S"), "qubes": qubes}, indent=1).encode()
+    part = out.with_name(out.name + ".part")
+    proc = None
+    try:
+        if passphrase:
+            if not shutil.which("gpg"):
+                raise Problem("encryption needs gpg (package gnupg)")
+            cmd, rfd = gpg_cmd("enc", passphrase, out_path=str(part))
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(rfd,))
+            os.close(rfd)
+            tar = tarfile.open(fileobj=proc.stdin, mode="w|gz")
+        else:
+            tar = tarfile.open(part, "w:gz")
+        with tar:
+            ti = tarfile.TarInfo("manifest.json")
+            ti.size, ti.mtime, ti.mode = len(manifest), int(time.time()), 0o600
+            tar.addfile(ti, io.BytesIO(manifest))
+            for q in qubes:
+                n = q["name"]
+                tar.add(mq.CONF / f"{n}.toml", arcname=f"boxes/{n}.toml", filter=_plain)
+                if q["files"]:
+                    def flt(ti):
+                        parts = Path(ti.name).parts          # home/NAME/[user/].cache is just a cache: leave it out
+                        if ".cache" in parts[2:4]:
+                            return None
+                        return _plain(ti)
+                    tar.add(mq.DATA / n / HOME_DIR_NAME, arcname=f"{HOME_DIR_NAME}/{n}", filter=flt)
+        if proc:
+            proc.stdin.close()
+            if proc.wait() != 0:
+                raise Problem("gpg failed: " + proc.stderr.read().decode(errors="replace").strip())
+        part.replace(out)
+    except BaseException:
+        if proc and proc.poll() is None:
+            proc.kill()
+        part.unlink(missing_ok=True)
+        raise
+    return qubes
+
+
+def _plain(ti):
+    ti.uid = ti.gid = 0
+    ti.uname = ti.gname = ""
+    return ti
+
+
+# ------------------------------------------------------------------ import
+def open_stream(path, passphrase):
+    """(tarfile, cleanup) for reading a .mqz file (plain or gpg-encrypted) as a stream."""
+    if is_encrypted(path):
+        if not passphrase:
+            raise Problem("this file is encrypted: a passphrase is needed")
+        cmd, rfd = gpg_cmd("dec", passphrase, in_path=str(path))
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(rfd,))
+        os.close(rfd)
+
+        def done():
+            proc.stdout.close()
+            proc.kill() if proc.poll() is None else None
+        try:
+            return tarfile.open(fileobj=proc.stdout, mode="r|gz"), done
+        except (tarfile.TarError, OSError):
+            done()
+            raise Problem("wrong passphrase, or not a MiniQubes export file")
+    return tarfile.open(path, "r|gz"), (lambda: None)
+
+
+def read_manifest(path, passphrase=None):
+    tar, done = open_stream(path, passphrase)
+    try:
+        for m in tar:
+            if m.name == "manifest.json":
+                data = json.loads(tar.extractfile(m).read().decode())
+                if data.get("format") != 1:
+                    raise Problem("this file is from a different MiniQubes version")
+                return data
+            break
+    except (tarfile.TarError, OSError, ValueError, EOFError):
+        raise Problem("wrong passphrase, or not a MiniQubes export file")
+    finally:
+        done()
+    raise Problem("not a MiniQubes export file")
+
+
+def sanitize(mq, box):
+    """Settings from a file we don't fully trust. No host-folder shares, no sound/camera."""
+    tier = box.get("tier") if box.get("tier") in ("trusted", "disposable") else "trusted"
+    level = box.get("seccomp", "standard")
+    deny = []
+    if level == "custom":
+        deny = [s for s in box.get("seccomp_deny", []) if isinstance(s, str) and s in mq.SYSCALLS]
+    elif level not in mq.SECCOMP_LEVELS:
+        level = "standard"
+    template = box.get("template", "alpine")
+    out = {
+        "template": template if isinstance(template, str) and mq.NAME_RE.match(template) else "alpine",
+        "tier": tier,
+        "color": box.get("color") if isinstance(box.get("color"), str) and mq.COLOR_RE.match(box["color"]) else "#888888",
+        "network": box.get("network") if box.get("network") in ("none", "direct", "internet") else "none",
+        "persistent": bool(box.get("persistent", True)),
+        "seccomp": level, "seccomp_deny": deny,
+        "frame": bool(box.get("frame", True)), "clipboard": bool(box.get("clipboard", True)),
+        "sound": False, "camera": False, "shares": [],
+        "apps": [a for a in box.get("apps", []) if isinstance(a, str)][:50],
+    }
+    return out
+
+
+def import_qubes(mq, path, selection, passphrase=None, replace=False):
+    """selection: {name in file: new name}. Returns a list of notes to show the user."""
+    notes = []
+    for old, new in selection.items():
+        if not mq.NAME_RE.match(new):
+            raise Problem(f"'{new}' isn't a valid qube name (lowercase letters, digits, - and _)")
+        if (mq.CONF / f"{new}.toml").exists() and not replace:
+            raise Problem(f"a qube called {new} already exists (pick another name, or replace it)")
+        if running_apps(new):
+            raise Problem(f"{new} has apps running. Close them first.")
+    mq.DATA.mkdir(parents=True, exist_ok=True)
+    tmp = mq.DATA / f".import-{os.getpid()}-{int(time.time())}"
+    tmp.mkdir(mode=0o700)
+    base = os.path.realpath(tmp)
+    boxes, homes = {}, set()
+    tar, done = open_stream(path, passphrase)
+    try:
+        for m in tar:
+            parts = Path(m.name).parts
+            if m.name.startswith("/") or ".." in parts or not parts:
+                continue
+            if parts[0] == "boxes" and len(parts) == 2 and parts[1].endswith(".toml") and m.isfile():
+                q = parts[1][:-5]
+                if q in selection and m.size < 100_000:
+                    boxes[q] = tomllib.loads(tar.extractfile(m).read().decode())
+                continue
+            if parts[0] == HOME_DIR_NAME and len(parts) >= 2 and parts[1] in selection:
+                if m.isdev() or m.isfifo() or m.islnk():
+                    continue
+                target = os.path.realpath(os.path.join(base, *parts))
+                if target != base and not target.startswith(base + os.sep):
+                    continue                    # a planted link tried to send a file outside
+                m.mode &= 0o755 if m.isdir() else 0o777
+                m.uid = m.gid = os.getuid()
+                m.uname = m.gname = ""
+                try:
+                    tar.extract(m, base, filter="tar")
+                except TypeError:
+                    tar.extract(m, base)
+                homes.add(parts[1])
+        done()
+        for old, new in selection.items():
+            if old not in boxes:
+                raise Problem(f"{old} isn't in the file")
+            box = sanitize(mq, boxes[old])
+            if not (mq.TEMPLATES / box["template"]).is_dir():
+                notes.append(f"{new}: needs the template '{box['template']}', which isn't installed here yet "
+                             "(Manage > Templates).")
+            if replace and (mq.CONF / f"{new}.toml").exists():
+                shutil.rmtree(mq.DATA / new, ignore_errors=True)
+            dest = mq.DATA / new
+            dest.mkdir(parents=True, exist_ok=True)
+            if old in homes:
+                if (dest / HOME_DIR_NAME).exists():
+                    shutil.rmtree(dest / HOME_DIR_NAME)
+                os.rename(tmp / HOME_DIR_NAME / old, dest / HOME_DIR_NAME)
+            mq.write_box(new, box)
+        notes.append("Folder shares were removed and sound/camera turned off for the imported qubes. "
+                     "Turn them on again in Manage if you want them.")
+    finally:
+        done()
+        shutil.rmtree(tmp, ignore_errors=True)
+    return notes
+
+
+# ------------------------------------------------------------------ window
+def gui():
+    from PySide6.QtCore import QThread, Signal
+    from PySide6.QtWidgets import (
+        QApplication, QCheckBox, QFileDialog, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
+        QListWidget, QListWidgetItem, QMessageBox, QProgressDialog, QPushButton, QVBoxLayout, QWidget)
+    from PySide6.QtCore import Qt
+
+    app = QApplication(sys.argv)
+    try:
+        mq = load_cli()
+    except Problem as e:
+        QMessageBox.critical(None, "Export / import", str(e))
+        return 1
+
+    class Worker(QThread):
+        done = Signal(object, object)
+
+        def __init__(self, fn):
+            super().__init__()
+            self.fn = fn
+
+        def run(self):
+            try:
+                self.done.emit(self.fn(), None)
+            except BaseException as e:      # shown to the user, never crash the window
+                self.done.emit(None, e)
+
+    class Win(QWidget):
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle("Export / import qubes")
+            self.resize(520, 520)
+            self.workers = []
+            g = QGroupBox("Export: save qubes into one file (for example on a USB stick)")
+            gv = QVBoxLayout(g)
+            self.list = QListWidget()
+            for n in sorted(p.stem for p in mq.CONF.glob("*.toml")) if mq.CONF.is_dir() else []:
+                it = QListWidgetItem(n)
+                it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+                it.setCheckState(Qt.Unchecked)
+                self.list.addItem(it)
+            self.files = QCheckBox("Include the qubes' saved files (home folder, without caches)")
+            self.files.setChecked(True)
+            self.enc = QCheckBox("Encrypt with a passphrase (recommended: the file holds everything saved in them)")
+            self.enc.setChecked(True)
+            self.pw = QLineEdit()
+            self.pw.setEchoMode(QLineEdit.Password)
+            self.pw.setPlaceholderText("passphrase")
+            btn = QPushButton("Export...")
+            btn.clicked.connect(self.do_export)
+            for w in (QLabel("Tick the qubes to take along:"), self.list, self.files, self.enc, self.pw, btn):
+                gv.addWidget(w)
+            g2 = QGroupBox("Import: bring qubes in from a file")
+            g2v = QVBoxLayout(g2)
+            g2v.addWidget(QLabel("Imported qubes need a template with the same name here. Folder shares, sound and "
+                                 "camera are NOT imported."))
+            b2 = QPushButton("Import...")
+            b2.clicked.connect(self.do_import)
+            g2v.addWidget(b2)
+            v = QVBoxLayout(self)
+            v.addWidget(g, 1)
+            v.addWidget(g2)
+
+        def busy(self, text, fn, then):
+            dlg = QProgressDialog(text, None, 0, 0, self)
+            dlg.setWindowModality(Qt.WindowModal)
+            dlg.setMinimumDuration(0)
+            dlg.show()
+            w = Worker(fn)
+            self.workers.append(w)
+
+            def finished(result, err):
+                dlg.close()
+                then(result, err)
+            w.done.connect(finished)
+            w.start()
+
+        def say(self, err, ok_text):
+            if err:
+                QMessageBox.warning(self, "Export / import", str(err) if isinstance(err, Problem) else f"Failed: {err}")
+            else:
+                QMessageBox.information(self, "Export / import", ok_text)
+
+        def do_export(self):
+            names = [self.list.item(i).text() for i in range(self.list.count())
+                     if self.list.item(i).checkState() == Qt.Checked]
+            if not names:
+                QMessageBox.information(self, "Export", "Tick at least one qube.")
+                return
+            pw = self.pw.text() if self.enc.isChecked() else None
+            if self.enc.isChecked() and not pw:
+                QMessageBox.information(self, "Export", "Type a passphrase, or untick encryption.")
+                return
+            start = Path("/run/media") / os.environ.get("USER", "")
+            start = start if start.is_dir() else Path.home()
+            out, _ = QFileDialog.getSaveFileName(self, "Save export file", str(start / f"qubes-{time.strftime('%Y%m%d')}.mqz"),
+                                                 "MiniQubes export (*.mqz)")
+            if not out:
+                return
+            if not out.endswith(".mqz"):
+                out += ".mqz"
+            self.busy("Exporting... (big qubes take a while)",
+                      lambda: export_qubes(mq, names, out, self.files.isChecked(), pw),
+                      lambda r, e: self.say(e, f"Saved {len(names)} qube(s) to\n{out}" + ("\nEncrypted." if pw else "\nNOT encrypted.")))
+
+        def do_import(self):
+            start = Path("/run/media") / os.environ.get("USER", "")
+            path, _ = QFileDialog.getOpenFileName(self, "Open export file", str(start if start.is_dir() else Path.home()),
+                                                  "MiniQubes export (*.mqz);;All files (*)")
+            if not path:
+                return
+            pw = None
+            if is_encrypted(path):
+                pw, ok = QInputDialog.getText(self, "Import", "Passphrase for this file:", QLineEdit.Password)
+                if not ok:
+                    return
+            try:
+                man = read_manifest(path, pw)
+            except Problem as e:
+                QMessageBox.warning(self, "Import", str(e))
+                return
+            selection, replace = {}, False
+            for q in man["qubes"]:
+                n = q["name"]
+                size = f"{q['bytes'] / 1e6:.0f} MB" if q.get("files") else "settings only"
+                if QMessageBox.question(self, "Import", f"Import the qube  {n}  ({size}, template {q.get('template') or '?'})?") \
+                        != QMessageBox.Yes:
+                    continue
+                new = n
+                if (mq.CONF / f"{n}.toml").exists():
+                    box = QMessageBox(QMessageBox.Question, "Import", f"You already have a qube called {n}.", QMessageBox.NoButton, self)
+                    rep = box.addButton("Replace it", QMessageBox.DestructiveRole)
+                    ren = box.addButton("Import under another name", QMessageBox.AcceptRole)
+                    box.addButton("Skip", QMessageBox.RejectRole)
+                    box.exec()
+                    if box.clickedButton() is ren:
+                        new, ok = QInputDialog.getText(self, "Import", "New name:", text=f"{n}-imported")
+                        if not ok:
+                            continue
+                    elif box.clickedButton() is rep:
+                        if QMessageBox.warning(self, "Replace", f"This DELETES the current {n} and all its files. Continue?",
+                                               QMessageBox.Yes | QMessageBox.Cancel) != QMessageBox.Yes:
+                            continue
+                        replace = True
+                    else:
+                        continue
+                selection[n] = new.strip()
+            if not selection:
+                return
+            self.busy("Importing...", lambda: import_qubes(mq, path, selection, pw, replace),
+                      lambda r, e: self.say(e, "Imported:\n  " + ", ".join(selection.values()) + "\n\n" + "\n".join(r or [])))
+
+    w = Win()
+    w.show()
+    return app.exec()
+
+
+def cli(argv):
+    ap = argparse.ArgumentParser(prog="mq-transfer", description="export / import qubes")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    e = sub.add_parser("export")
+    e.add_argument("names", nargs="+")
+    e.add_argument("-o", "--out")
+    e.add_argument("--no-files", action="store_true", help="settings only, no saved files")
+    e.add_argument("--encrypt", action="store_true", help="ask for a passphrase (or set MQ_PASS)")
+    i = sub.add_parser("import")
+    i.add_argument("file")
+    i.add_argument("--only")
+    i.add_argument("--as", dest="newname")
+    i.add_argument("--replace", action="store_true")
+    a = ap.parse_args(argv)
+    mq = load_cli()
+    if a.cmd == "export":
+        out = a.out or str(Path.home() / f"qubes-{time.strftime('%Y%m%d')}.mqz")
+        pw = (os.environ.get("MQ_PASS") or getpass.getpass("passphrase: ")) if a.encrypt else None
+        export_qubes(mq, a.names, out, not a.no_files, pw)
+        print(f"saved {', '.join(a.names)} to {out}")
+    else:
+        pw = (os.environ.get("MQ_PASS") or getpass.getpass("passphrase: ")) if is_encrypted(a.file) else None
+        man = read_manifest(a.file, pw)
+        names = [q["name"] for q in man["qubes"]]
+        if a.only:
+            names = [n for n in names if n == a.only]
+        if a.newname and len(names) != 1:
+            raise Problem("--as needs exactly one qube (use --only NAME)")
+        sel = {n: (a.newname or n) for n in names}
+        for note in import_qubes(mq, a.file, sel, pw, a.replace):
+            print(note)
+        print("imported:", ", ".join(sel.values()))
+
+
+if __name__ == "__main__":
+    try:
+        if len(sys.argv) > 1:
+            cli(sys.argv[1:])
+        else:
+            sys.exit(gui())
+    except Problem as e:
+        print(f"mq-transfer: {e}", file=sys.stderr)
+        sys.exit(1)

@@ -1,0 +1,243 @@
+#!/usr/bin/python3
+"""mq-deadman - dead man's switch: pick a USB stick as a key. Pull it out and you are logged out (qubes closed) or the PC shuts down.
+
+  mq-deadman           window: see/arm/disarm the switch
+  mq-deadman --ask     the question shown at login ("Use a dead man's switch?")
+  mq-deadman --watch KEY ACTION LP [close]    (used internally; runs in the background)
+
+ACTION is `logout` or `shutdown`. Logging out always closes every running qube first. `close` does the same before a shutdown.
+Turn the login question off for good: Manage > Desktop settings > System.
+The key is the USB DRIVE itself (matched by its hardware id), so it works wherever you plug it in.
+This is a convenience lock for walking away from the PC. It does not stop someone who can already
+run programs on your account, or who has the key."""
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+RUN = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+STATE = RUN / "miniqubes-deadman.json"
+BYID = Path(os.environ.get("MQ_BYID", "/dev/disk/by-id"))
+DESKTOP = Path.home() / ".config/miniqubes/desktop"
+
+
+def keys():
+    """USB disks currently plugged in: [(by-id name, nice label)]"""
+    out = []
+    if not BYID.is_dir():
+        return out
+    for p in sorted(BYID.glob("usb-*")):
+        if "-part" in p.name:
+            continue
+        label = p.name[4:].rsplit("-0:0", 1)[0].replace("_", " ")
+        try:
+            dev = os.path.realpath(p)
+            size = Path("/sys/class/block", os.path.basename(dev), "size").read_text().strip()
+            label += f"  ({int(size) * 512 / 1e9:.0f} GB)"
+        except (OSError, ValueError):
+            pass
+        out.append((p.name, label))
+    return out
+
+
+def present(key):
+    return (BYID / key).exists()
+
+
+def state():
+    try:
+        s = json.loads(STATE.read_text())
+        os.kill(s["pid"], 0)
+        return s
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def arm(key, action, close):
+    if state():
+        raise RuntimeError("already armed")
+    if not present(key):
+        raise RuntimeError("that drive isn't plugged in")
+    lp = os.environ.get("MQ_LP") or os.environ.get("LABWC_PID") or ""
+    argv = [sys.argv[0] if os.path.isabs(sys.argv[0]) else shutil.which("mq-deadman") or sys.argv[0],
+            "--watch", key, action, lp] + (["close"] if close else [])
+    p = subprocess.Popen(argv, start_new_session=True, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    STATE.write_text(json.dumps({"pid": p.pid, "key": key, "action": action, "close": close}))
+    STATE.chmod(0o600)
+
+
+def disarm():
+    s = state()
+    if not s:
+        return
+    if not present(s["key"]):
+        raise RuntimeError("the key isn't plugged in: it can only be switched off while it is")
+    os.kill(s["pid"], signal.SIGTERM)
+    STATE.unlink(missing_ok=True)
+
+
+# ------------------------------------------------------------------ the watcher
+def kill_qubes():
+    for d in os.scandir("/proc"):
+        if not d.name.isdigit():
+            continue
+        try:
+            if Path(d.path, "comm").read_text().strip() != "bwrap":
+                continue
+            argv = Path(d.path, "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if b"MQ_BOX" in argv:
+            try:
+                os.kill(int(d.name), signal.SIGKILL)
+            except OSError:
+                pass
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def fire(action, lp, close):
+    if close or action == "logout":
+        kill_qubes()
+    if action == "shutdown":
+        subprocess.run(["systemctl", "poweroff"])
+        return True
+    if shutil.which("mq-logout"):       # a real logout: the session ends, nothing is left unlocked behind it
+        subprocess.run(["mq-logout"], env={**os.environ, **({"LABWC_PID": lp} if lp else {})})
+    elif lp and lp.isdigit():
+        os.kill(int(lp), signal.SIGTERM)
+    return True
+
+
+def watch(key, action, lp, close):
+    wanted_stop = []
+    signal.signal(signal.SIGTERM, lambda *a: wanted_stop.append(1))
+    lpid = int(lp) if lp.isdigit() else None
+    missing = 0
+    while True:
+        time.sleep(0.4)
+        if lpid and not alive(lpid):            # you logged out: not a reason to fire
+            break
+        here = present(key)
+        if wanted_stop and here:                # switched off with the key in
+            break
+        wanted_stop.clear()                     # SIGTERM with the key out is ignored (it would be a way around it)
+        missing = 0 if here else missing + 1
+        if missing == 2:
+            if fire(action, lp, close):
+                break
+    STATE.unlink(missing_ok=True)
+
+
+# ------------------------------------------------------------------ windows
+def gui(ask):
+    from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QLabel, QMessageBox, QPushButton,
+                                   QVBoxLayout, QWidget, QHBoxLayout)
+    from PySide6.QtCore import QTimer
+    app = QApplication(sys.argv)
+
+    class W(QWidget):
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle("Dead man's switch")
+            self.setMinimumWidth(440)
+            v = QVBoxLayout(self)
+            self.info = QLabel()
+            self.info.setWordWrap(True)
+            v.addWidget(self.info)
+            self.drive = QComboBox()
+            self.action = QComboBox()
+            self.action.addItem("Log out (closes all qubes)", "logout")
+            self.action.addItem("Shut the PC down", "shutdown")
+            self.close_q = QCheckBox("Also close all running qubes first")
+            self.close_q.setChecked(True)
+            self.go = QPushButton()
+            self.go.clicked.connect(self.toggle)
+            row = QHBoxLayout()
+            self.later = QPushButton("Not now" if ask else "Close")
+            self.later.clicked.connect(self.close)
+            row.addWidget(self.later)
+            row.addWidget(self.go)
+            for w in (QLabel("USB drive to use as the key:"), self.drive, QLabel("When it is pulled out:"),
+                      self.action, self.close_q):
+                v.addWidget(w)
+            v.addLayout(row)
+            self.t = QTimer(self)
+            self.t.timeout.connect(self.refresh)
+            self.t.start(1000)
+            self.refresh()
+
+        def refresh(self):
+            s = state()
+            idle = s is None
+            for w in (self.drive, self.action, self.close_q):
+                w.setEnabled(idle)
+            if idle:
+                cur = self.drive.currentData()
+                self.drive.blockSignals(True)
+                self.drive.clear()
+                for k, label in keys():
+                    self.drive.addItem(label, k)
+                i = self.drive.findData(cur)
+                if i >= 0:
+                    self.drive.setCurrentIndex(i)
+                self.drive.blockSignals(False)
+                self.info.setText("Off. Plug in a USB drive, pick it, and arm. If it is removed later, the PC will log out "
+                                  "or shut down. Everything on that drive stays as it is.")
+                self.go.setText("Arm the switch")
+                self.go.setEnabled(self.drive.count() > 0)
+            else:
+                ok = present(s["key"])
+                self.info.setText(f"ARMED ({'shutdown' if s['action'] == 'shutdown' else 'log out'}). "
+                                  + ("Switching it off needs the key plugged in." if ok else "The key is out!"))
+                self.go.setText("Switch off")
+                self.go.setEnabled(ok)
+
+        def toggle(self):
+            try:
+                if state():
+                    disarm()
+                else:
+                    if self.action.currentData() == "shutdown" and QMessageBox.warning(
+                            self, "Shut down", "Pulling the key will shut the PC down at once. Unsaved work in apps is lost. "
+                            "Continue?", QMessageBox.Yes | QMessageBox.Cancel) != QMessageBox.Yes:
+                        return
+                    arm(self.drive.currentData(), self.action.currentData(), self.close_q.isChecked())
+                    if ask:
+                        self.close()
+                        return
+            except (RuntimeError, OSError) as e:
+                QMessageBox.warning(self, "Dead man's switch", str(e))
+            self.refresh()
+
+    w = W()
+    if ask:
+        w.setWindowTitle("Use a dead man's switch?")
+        w.info.setText("Use a USB drive as a key? When you pull it out, the PC logs out or shuts down.")
+    w.show()
+    return app.exec()
+
+
+def main():
+    a = sys.argv[1:]
+    if a[:1] == ["--watch"] and len(a) >= 4:
+        watch(a[1], a[2], a[3], "close" in a[4:])
+        return 0
+    if a[:1] == ["--ask"] and state():
+        return 0                                  # already armed in this login
+    return gui(a[:1] == ["--ask"])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

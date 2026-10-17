@@ -1,0 +1,205 @@
+#!/usr/bin/python3
+"""mq-template-manager - make and manage templates (the read-only systems your qubes start from).   (Manage > Templates...)
+
+Give a sensitive qube its own template, e.g. "vault": a program installed in the shared template can then never
+touch the vault qube's system. A new template is either a fresh Alpine or Arch, or a copy of one you already have.
+Anything that needs root opens a terminal and asks for your password there."""
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+CONF = Path(os.environ.get("MQ_CONF", Path.home() / ".config/miniqubes/boxes"))
+TEMPLATES = Path(os.environ.get("MQ_TEMPLATES", "/var/lib/miniqubes/templates"))
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+
+
+def kind_of(root):
+    if (root / "etc/alpine-release").exists():
+        return "Alpine"
+    if (root / "etc/arch-release").exists() or (root / "usr/bin/pacman").exists():
+        return "Arch"
+    return "?"
+
+
+def templates():
+    if not TEMPLATES.is_dir():
+        return []
+    return sorted(p.name for p in TEMPLATES.iterdir() if p.is_dir())
+
+
+def users_of(template):
+    out = []
+    for p in sorted(CONF.glob("*.toml")) if CONF.is_dir() else []:
+        try:
+            if tomllib.loads(p.read_text()).get("template") == template:
+                out.append(p.stem)
+        except (OSError, ValueError):
+            pass
+    return out
+
+
+def terminal_argv(title, script):
+    for t in ("foot", "alacritty", "kitty", "xterm"):
+        if shutil.which(t):
+            base = [t, "--title", title] if t == "kitty" else [t, "-T", title]
+            return base + (["sh", "-c", script] if t == "kitty" else ["-e", "sh", "-c", script])
+    return None
+
+
+def build_command(kind, name, source=None):
+    """argv for the miniqubes command that makes the template."""
+    if kind == "copy":
+        return ["miniqubes", "template", "clone", source, name]
+    return ["miniqubes", "template", "build", kind, "--as", name]
+
+
+def main():
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import (
+        QApplication, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QHeaderView, QInputDialog,
+        QLabel, QLineEdit, QMessageBox, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
+
+    app = QApplication(sys.argv)
+
+    def run_in_terminal(parent, title, argv):
+        script = shlex.join(argv) + '; echo; printf "Done. Press Enter to close... "; read _'
+        t = terminal_argv(title, script)
+        if not t:
+            QMessageBox.warning(parent, "No terminal", "Install a terminal (foot, alacritty, kitty or xterm).")
+            return
+        subprocess.Popen(t, start_new_session=True)
+
+    class NewTemplate(QDialog):
+        def __init__(self, parent):
+            super().__init__(parent)
+            self.setWindowTitle("New template")
+            self.name = QLineEdit()
+            self.name.setPlaceholderText("for example: vault")
+            self.base = QComboBox()
+            self.base.addItem("Alpine, fresh (small and fast; downloads ~100 MB)", ("alpine", None))
+            self.base.addItem("Arch, fresh (runs almost everything; needs arch-install-scripts)", ("arch", None))
+            for t in templates():
+                self.base.addItem(f"Copy of  {t}", ("copy", t))
+            about = QLabel("A template is the shared read-only system that qubes start from.\nA qube with its own "
+                           "template can't be affected by programs you install for other qubes.\nAfterwards, pick it "
+                           "for a qube in Manage, in that qube's \"Template\" box.")
+            bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            bb.accepted.connect(self.accept)
+            bb.rejected.connect(self.reject)
+            f = QFormLayout(self)
+            f.addRow(about)
+            f.addRow("Name", self.name)
+            f.addRow("Start from", self.base)
+            f.addRow(bb)
+
+    class Win(QWidget):
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle("Templates")
+            self.resize(640, 420)
+            note = QLabel("Templates are the systems your qubes start from. Changing one changes every qube that "
+                          "uses it, so give sensitive qubes their own.")
+            note.setWordWrap(True)
+            self.table = QTableWidget(0, 3)
+            self.table.setHorizontalHeaderLabels(["Template", "System", "Used by"])
+            self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+            self.table.setSelectionBehavior(QTableWidget.SelectRows)
+            self.table.setSelectionMode(QTableWidget.SingleSelection)
+            self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+            row = QHBoxLayout()
+            for text, fn in (("New template...", self.new), ("Install programs...", self.install),
+                             ("Update", self.update), ("Root shell", self.shell), ("Delete", self.delete)):
+                b = QPushButton(text)
+                b.clicked.connect(fn)
+                row.addWidget(b)
+            v = QVBoxLayout(self)
+            v.addWidget(note)
+            v.addWidget(self.table, 1)
+            v.addLayout(row)
+            self.names = []
+            self.refresh()
+            t = QTimer(self)
+            t.timeout.connect(self.refresh)
+            t.start(3000)
+
+        def refresh(self):
+            keep = self.current()
+            self.names = templates()
+            self.table.setRowCount(len(self.names))
+            for i, n in enumerate(self.names):
+                for j, text in enumerate((n, kind_of(TEMPLATES / n), ", ".join(users_of(n)) or "-")):
+                    self.table.setItem(i, j, QTableWidgetItem(text))
+                if n == keep:
+                    self.table.selectRow(i)
+
+        def current(self):
+            r = self.table.currentRow()
+            return self.names[r] if 0 <= r < len(self.names) else None
+
+        def pick(self):
+            n = self.current()
+            if not n:
+                QMessageBox.information(self, "Templates", "Click a template in the list first.")
+            return n
+
+        def new(self):
+            d = NewTemplate(self)
+            while d.exec() == QDialog.Accepted:
+                name = d.name.text().strip()
+                if not NAME_RE.match(name):
+                    QMessageBox.warning(d, "Name", "Use lowercase letters, digits, - and _ (max 32).")
+                    continue
+                if name in templates():
+                    QMessageBox.warning(d, "Name", f"A template called {name} already exists.")
+                    continue
+                kind, source = d.base.currentData()
+                run_in_terminal(self, f"New template {name}", build_command(kind, name, source))
+                break
+
+        def install(self):
+            n = self.pick()
+            if not n:
+                return
+            text, ok = QInputDialog.getText(
+                self, "Install programs", f"Packages to install into  {n}  (space separated).\n"
+                "Every qube using this template gets them. For sound: libpulse. For copy/paste: wl-clipboard.")
+            if ok and text.strip():
+                run_in_terminal(self, f"Install into {n}", ["miniqubes", "template", "install", n, *text.split()])
+
+        def update(self):
+            n = self.pick()
+            if n:
+                run_in_terminal(self, f"Update {n}", ["miniqubes", "template", "update", n])
+
+        def shell(self):
+            n = self.pick()
+            if n and QMessageBox.warning(
+                    self, "Root shell", f"A root shell INSIDE the template {n}. Everything you change there changes "
+                    "every qube that uses it. Continue?", QMessageBox.Yes | QMessageBox.Cancel) == QMessageBox.Yes:
+                run_in_terminal(self, f"Root shell in {n}", ["miniqubes", "template", "shell", n])
+
+        def delete(self):
+            n = self.pick()
+            if not n:
+                return
+            used = users_of(n)
+            if used:
+                QMessageBox.warning(self, "In use", f"{n} is used by: {', '.join(used)}.\n"
+                                    "Move those qubes to another template first (Manage > the qube > Template).")
+                return
+            if QMessageBox.question(self, "Delete template", f"Delete the template {n}? This can't be undone.") \
+                    == QMessageBox.Yes:
+                run_in_terminal(self, f"Delete {n}", ["miniqubes", "template", "delete", n, "--yes"])
+
+    w = Win()
+    w.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

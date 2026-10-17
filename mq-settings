@@ -177,10 +177,22 @@ def main():
             u.clicked.connect(self.upgrade)
             r = QPushButton("Restore desktop defaults...")
             r.clicked.connect(self.restore)
-            for b in (t, u, r):
+            self.dead = QCheckBox("At login, ask if I want a dead man's switch (USB key: pull it out = log out / shut down)")
+            self.dead.setChecked((D / "deadman").read_text().strip() != "off" if (D / "deadman").exists() else True)
+            self.dead.toggled.connect(self.set_dead)
+            dm = QPushButton("Dead man's switch...")
+            dm.clicked.connect(lambda: subprocess.Popen(["mq-deadman"], start_new_session=True))
+            for b in (t, u, r, self.dead, dm):
                 v.addWidget(b)
             v.addStretch(1)
             return w
+
+        def set_dead(self, on):
+            try:
+                D.mkdir(parents=True, exist_ok=True)
+                (D / "deadman").write_text("on\n" if on else "off\n")
+            except OSError as e:
+                QMessageBox.warning(self, "Settings", f"Couldn't save: {e}")
 
         def confirm(self, title, text, yes="Continue"):
             m = QMessageBox(QMessageBox.Warning, title, text, QMessageBox.NoButton, self)

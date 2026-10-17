@@ -229,11 +229,29 @@ def patch_usb(text, say):
     return text.replace(USB_DEF_OLD, USB_HELPER + USB_DEF_OLD).replace(USB_RUN_OLD, USB_RUN_NEW), []
 
 
+TPL_MARK = "# mq:templates"
+TPL_FUNCS = '# mq:templates  (own templates: build alpine/arch under a name, clone, delete)\ndef user_conf():\n    # under sudo the boxes folder is the invoking user\'s, not root\'s\n    u = os.environ.get("SUDO_USER")\n    if os.geteuid() == 0 and u and "MQ_CONF" not in os.environ:\n        import pwd\n        return Path(pwd.getpwnam(u).pw_dir) / ".config/miniqubes/boxes"\n    return CONF\n\n\ndef boxes_using(template):\n    out = []\n    for p in sorted(user_conf().glob("*.toml")):\n        try:\n            if tomllib.loads(p.read_text()).get("template") == template:\n                out.append(p.stem)\n        except (OSError, ValueError):\n            pass\n    return out\n\n\ndef cmd_tclone(a):\n    need_root()\n    if not NAME_RE.match(a.new):\n        die("template name: lowercase letters, digits, - and _ (max 32)")\n    src, dest = TEMPLATES / a.name, TEMPLATES / a.new\n    if not src.is_dir():\n        die(f"no template \'{a.name}\'")\n    if dest.exists():\n        die(f"template \'{a.new}\' already exists")\n    print(f"copying {a.name} -> {a.new} (this can take a minute) ...")\n    try:\n        subprocess.run(["cp", "-a", "--reflink=auto", str(src), str(dest)], check=True)\n    except BaseException:\n        shutil.rmtree(dest, ignore_errors=True)\n        raise\n    print(f"template \'{a.new}\' ready. It is separate from \'{a.name}\': programs installed in one are not in the other.")\n\n\ndef cmd_tdelete(a):\n    need_root()\n    root = TEMPLATES / a.name\n    if not root.is_dir():\n        die(f"no template \'{a.name}\'")\n    users = boxes_using(a.name)\n    if users:\n        die(f"template \'{a.name}\' is used by: {\', \'.join(users)}. Move those qubes to another template first.")\n    if not a.yes and input(f"delete template \'{a.name}\'? type its name to confirm: ") != a.name:\n        die("cancelled")\n    shutil.rmtree(root)\n    print(f"deleted template \'{a.name}\'")\n\n\n'
+TPL_EDITS = [('"pacstrap", "-K", str(dest), "base", "firefox", "mesa", "ttf-dejavu"]', '"pacstrap", "-K", str(dest), "base", "firefox", "mesa", "ttf-dejavu", "labwc", "foot", "wl-clipboard", "libpulse"]'), ('ca-certificates libpulse "', 'ca-certificates libpulse labwc foot wl-clipboard "'), ('    dest = TEMPLATES / a.name\n    if dest.exists():\n        die(f"template \'{a.name}\' already exists (delete {dest} to rebuild)")\n', '    name = a.as_name or a.name\n    if not NAME_RE.match(name):\n        die("template name: lowercase letters, digits, - and _ (max 32)")\n    dest = TEMPLATES / name\n    if dest.exists():\n        die(f"template \'{name}\' already exists (delete {dest} to rebuild)")\n'), ('    print(f"template \'{a.name}\' ready")\n', '    print(f"template \'{dest.name}\' ready")\n'), ('s = ts.add_parser("build"); s.add_argument("name", choices=["alpine", "arch"]); s.set_defaults(fn=cmd_tbuild)', 's = ts.add_parser("build"); s.add_argument("name", choices=["alpine", "arch"])\n    s.add_argument("--as", dest="as_name", metavar="NAME", help="save it under this template name (default: alpine / arch)")\n    s.set_defaults(fn=cmd_tbuild)'), ('    s = ts.add_parser("shell"); s.add_argument("name"); s.set_defaults(fn=cmd_tshell)\n', '    s = ts.add_parser("shell"); s.add_argument("name"); s.set_defaults(fn=cmd_tshell)\n    s = ts.add_parser("clone", help="copy a template under a new name"); s.add_argument("name"); s.add_argument("new"); s.set_defaults(fn=cmd_tclone)\n    s = ts.add_parser("delete", help="delete a template nothing uses"); s.add_argument("name"); s.add_argument("--yes", action="store_true"); s.set_defaults(fn=cmd_tdelete)\n')]
+TPL_ANCHOR = "# ---------------------------------------------------------------- cli\n"
+
+
+def patch_tpl(text, say):
+    if TPL_MARK in text:
+        return text, []
+    if text.count(TPL_ANCHOR) != 1 or any(text.count(o) != 1 for o, _ in TPL_EDITS):
+        return text, ["own templates (arch build / clone / delete)"]
+    for o, n in TPL_EDITS:
+        text = text.replace(o, n)
+    say("patched: own templates (build under a name, clone, delete; arch gets labwc/foot)")
+    return text.replace(TPL_ANCHOR, TPL_FUNCS + TPL_ANCHOR), []
+
+
 def patch_cli(text, say):
     text, p1 = patch_net(text, say)
     text, p2 = patch_clip(text, say)
     text, p3 = patch_usb(text, say)
-    return text, p1 + p2 + p3
+    text, p4 = patch_tpl(text, say)
+    return text, p1 + p2 + p3 + p4
 
 
 HELPER_GUI = 'def in_root(root, p):\n    """Follow symlinks as if `root` were / (links inside a template point at the template, not at this computer)."""\n    root, cur, hops = Path(root), Path(root), 0\n    parts = list(Path(p).relative_to(root).parts)\n    while parts:\n        part = parts.pop(0)\n        if part == "..":\n            cur = cur.parent if cur != root else cur\n            continue\n        nxt = cur / part\n        if nxt.is_symlink() and hops < 40:\n            hops += 1\n            t = os.readlink(nxt)\n            if t.startswith("/"):\n                cur, parts = root, list(Path(t).parts[1:]) + parts\n            else:\n                parts = list(Path(t).parts) + parts\n        else:\n            cur = nxt\n    return cur\n\n\n'
@@ -303,13 +321,104 @@ GUI_EDITS = [
     ("qube kind label",
      'return "Everyday" if b.get("network") == "direct" else "Offline"',
      'return "Everyday" if b.get("network") in ("direct", "internet") else "Offline"'),
+    ('template row',
+     '        sf.addRow(self.frame)\n',
+     '        self.tpl = QComboBox()\n        self.tpl.setToolTip("The base system this qube runs on. Give a sensitive qube (a password vault) its OWN base "\n                            "system (Templates...) so a program installed for another qube can never be part of it.")\n        self.tpl.activated.connect(self.move_template)\n        sf.addRow("Base system", self.tpl)\n        sf.addRow(self.frame)\n'),
+    ('template load',
+     '            self.fill_programs(b)\n',
+     '            self.tpl.clear()\n            names = sorted(p.name for p in MQ.TEMPLATES.iterdir() if p.is_dir()) if MQ.TEMPLATES.is_dir() else []\n            cur_t = b.get("template", DEFAULT_TEMPLATE)\n            if cur_t not in names:\n                names.append(cur_t)\n            for n_t in names:\n                self.tpl.addItem(n_t, n_t)\n            self.tpl.setCurrentIndex(self.tpl.findData(cur_t))\n            self.fill_programs(b)\n'),
+    ('template save',
+     '        b["clipboard"] = self.clip.isChecked()\n',
+     '        b["clipboard"] = self.clip.isChecked()\n        if self.tpl.currentData():\n            b["template"] = self.tpl.currentData()\n'),
+    ('template helper',
+     '    def build_base(self):\n',
+     '    def cur_tpl(self):\n        b = self.load(self.name) if getattr(self, "name", None) else None\n        return (b or {}).get("template") or DEFAULT_TEMPLATE\n\n    def build_base(self):\n'),
+    ('template update',
+     'self.terminal([CLI, "template", "update", DEFAULT_TEMPLATE])',
+     'self.terminal([CLI, "template", "update", self.cur_tpl()])'),
+    ('template shell',
+     'self.terminal([CLI, "template", "shell", DEFAULT_TEMPLATE])',
+     'self.terminal([CLI, "template", "shell", self.cur_tpl()])'),
+    ('template install',
+     'self.terminal([CLI, "template", "install", DEFAULT_TEMPLATE, *text.split()])',
+     'self.terminal([CLI, "template", "install", self.cur_tpl(), *text.split()])'),
+    ('template ready',
+     '        ready = (MQ.TEMPLATES / DEFAULT_TEMPLATE).is_dir()\n',
+     '        ready = (MQ.TEMPLATES / self.cur_tpl()).is_dir()\n'),
+    ('template label',
+     'f"Base system \'{DEFAULT_TEMPLATE}\' is ready. Programs installed here appear in every qube."',
+     'f"Base system \'{self.cur_tpl()}\' is ready. Programs installed here appear in every qube that uses it."'),
+    ('tools buttons',
+     '        lv.addWidget(usbb)\n',
+     '        lv.addWidget(usbb)\n        for text_b, tip_b, prog_b in (\n                ("Templates...", "Make separate base systems (Alpine / Arch / copies), for example one just for a vault", "mq-template-manager"),\n                ("Export / import qubes...", "Take qubes with you on a USB stick, or bring them in", "mq-transfer"),\n                ("Dead man\'s switch...", "Lock or shut down when a USB key is pulled out", "mq-deadman")):\n            tb = QPushButton(text_b)\n            tb.setToolTip(tip_b)\n            tb.clicked.connect(lambda _=False, prog_b=prog_b: subprocess.Popen([prog_b], start_new_session=True))\n            lv.addWidget(tb)\n'),
+    ('template upgrade',
+     '        self.tpl.currentIndexChanged.connect(self.save_settings)\n',
+     '        self.tpl.activated.connect(self.move_template)\n'),
+    ('template move',
+     '    def cur_tpl(self):\n',
+     '    def running_in(self, name):\n        for d in os.scandir("/proc"):\n            if d.name.isdigit():\n                try:\n                    if Path(d.path, "comm").read_text().strip() != "bwrap":\n                        continue\n                    argv = Path(d.path, "cmdline").read_bytes().split(b"\\0")\n                except OSError:\n                    continue\n                if b"--setenv" in argv and any(argv[i] == b"MQ_BOX" and argv[i + 1].decode() == name\n                                               for i in range(len(argv) - 1)):\n                    return True\n        return False\n\n    def move_template(self, *_):\n        if self.loading or not self.name:\n            return\n        new_t = self.tpl.currentData()\n        b = self.load(self.name)\n        if b is None or not new_t or new_t == b.get("template"):\n            return\n        old_t = b.get("template")\n        back = lambda: self.tpl.setCurrentIndex(self.tpl.findData(old_t))\n        if self.running_in(self.name):\n            QMessageBox.warning(self, "Move", "Close this qube\'s programs first.")\n            back()\n            return\n        extra = ""\n        root = MQ.TEMPLATES / new_t\n        if root.is_dir() and b.get("apps"):\n            have = {shlex.join(cmd) for _n, cmd, _i in template_apps(root)}\n            gone = [a for a in b["apps"] if a not in have]\n            if gone:\n                extra = f"\\n\\n{len(gone)} of its {len(b[\'apps\'])} listed programs are not installed in \'{new_t}\' yet " \\\n                        "and won\'t start until you install them there."\n        elif not root.is_dir():\n            extra = f"\\n\\nThe base system \'{new_t}\' isn\'t set up yet."\n        if QMessageBox.question(self, "Move to another base system",\n                                f"Move \'{self.name}\' from base system \'{old_t}\' to \'{new_t}\'?\\n\\n"\n                                "Everything saved in the qube (files, logins, settings) stays exactly as it is. "\n                                "Only the programs underneath change." + extra,\n                                QMessageBox.Yes | QMessageBox.Cancel) != QMessageBox.Yes:\n            back()\n            return\n        b["template"] = new_t\n        MQ.write_box(self.name, b)\n        self.refresh()\n\n    def cur_tpl(self):\n'),
+    ('new qube template combo',
+     '            self.kind.addItem(f"{title}: {about}", key)\n',
+     '            self.kind.addItem(f"{title}: {about}", key)\n        self.tpl = QComboBox()\n        self.tpl.addItem("Default for this type", None)\n        for t_n in sorted(p.name for p in MQ.TEMPLATES.iterdir() if p.is_dir()) if MQ.TEMPLATES.is_dir() else []:\n            self.tpl.addItem(t_n, t_n)\n        self.tpl.setToolTip("Which base system it runs on. Pick a separate one for anything sensitive (Templates... makes them).")\n'),
+    ('new qube template row',
+     '        form.addRow("Type", self.kind)\n',
+     '        form.addRow("Type", self.kind)\n        form.addRow("Base system", self.tpl)\n'),
+    ('new qube template use',
+     '[CLI, "create", name, "--preset", dlg.kind.currentData()],',
+     '[CLI, "create", name, "--preset", dlg.kind.currentData(),\n                            *(["--template", dlg.tpl.currentData()] if dlg.tpl.currentData() else [])],'),
+    ('template install choose',
+     'self.terminal([CLI, "template", "install", self.cur_tpl(), *text.split()])',
+     'names = sorted(p.name for p in MQ.TEMPLATES.iterdir() if p.is_dir()) if MQ.TEMPLATES.is_dir() else []\n            if not names:\n                QMessageBox.information(self, "Install programs", "No base system exists yet. Set one up first.")\n                return\n            cur_i = names.index(self.cur_tpl()) if self.cur_tpl() in names else 0\n            tpl, ok2 = QInputDialog.getItem(self, "Install programs", "Install into which base system?\\n"\n                                            "(Only qubes that use it will see the programs.)", names, cur_i, False)\n            if ok2:\n                self.terminal([CLI, "template", "install", tpl, *text.split()])'),
+    ('ui window size',
+     '        self.resize(1100, 720)\n',
+     '        scr = QApplication.primaryScreen().availableGeometry()\n        self.resize(min(1100, int(scr.width() * 0.92)), min(720, int(scr.height() * 0.9)))\n        self.setMinimumSize(560, 380)\n'),
+    ('ui left scroll',
+     '        cl.addWidget(left)\n',
+     '        ls = QScrollArea()                    # the left column scrolls instead of forcing a tall window\n        ls.setWidgetResizable(True)\n        ls.setWidget(left)\n        ls.setFrameShape(QScrollArea.Shape.NoFrame)\n        ls.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)\n        ls.setMinimumWidth(250)\n        ls.setMaximumWidth(320)\n        self.qubes.setMinimumHeight(140)\n        cl.addWidget(ls)\n'),
+    ('ui polish',
+     '        self.reaper = QTimer(self)\n',
+     '        # ---- tidy-up: one Tools menu instead of a column of buttons, wrapping text, narrow-window friendly\n        from PySide6.QtWidgets import QMenu\n        tools_menu = QMenu(self)\n        for btn in left.findChildren(QPushButton):\n            if btn.text() in ("Desktop settings...", "USB drives...", "Templates...", "Export / import qubes...",\n                              "Dead man\'s switch..."):\n                act = tools_menu.addAction(btn.text().rstrip("."))\n                act.setToolTip(btn.toolTip())\n                act.triggered.connect(lambda _=False, b=btn: b.click())\n                btn.hide()\n        tools_btn = QPushButton("Tools  \\u25be")\n        tools_btn.setMenu(tools_menu)\n        lv.addWidget(tools_btn)\n        for lab in right.findChildren(QLabel):\n            lab.setWordWrap(True)\n        for cb in (self.internet, self.security, self.tpl):\n            cb.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)\n            cb.setMinimumContentsLength(16)\n        sf.setRowWrapPolicy(QFormLayout.WrapLongRows)\n        self.relayout = QTimer(self)\n        self.relayout.setSingleShot(True)\n        self.relayout.timeout.connect(self.relayout_programs)\n\n        self.reaper = QTimer(self)\n'),
+    ('ui methods',
+     '    def fill_programs(self, b):\n',
+     '    def start_tool(self, prog):\n        try:\n            subprocess.Popen([prog], start_new_session=True)\n        except OSError:\n            QMessageBox.warning(self, "Not installed", f"{prog} isn\'t installed. Run ./install.sh again from the MiniQubes folder.")\n\n    def grid_cols(self):\n        return max(1, min(6, (self.width() - 340) // 175))\n\n    def relayout_programs(self):\n        b = self.load(self.name) if self.name else None\n        if b is not None:\n            self.fill_programs(b)\n\n    def resizeEvent(self, e):\n        super().resizeEvent(e)\n        if hasattr(self, "relayout") and getattr(self, "_cols", None) != self.grid_cols():\n            self.relayout.start(120)\n\n    def fill_programs(self, b):\n'),
+    ('ui grid cols',
+     '        for i, (cmd, name, icon) in enumerate(progs):\n',
+     '        cols = self._cols = self.grid_cols()\n        for i, (cmd, name, icon) in enumerate(progs):\n'),
+    ('ui grid place',
+     '            self.grid.addWidget(btn, i // 4, i % 4)\n',
+     '            self.grid.addWidget(btn, i // cols, i % cols)\n'),
+    ('ui tool settings',
+     'subprocess.Popen(["mq-settings"], start_new_session=True)',
+     'self.start_tool("mq-settings")'),
+    ('ui tool usb',
+     'subprocess.Popen(["mq-usb"], start_new_session=True)',
+     'self.start_tool("mq-usb")'),
+    ('ui tool others',
+     'subprocess.Popen([prog_b], start_new_session=True)',
+     'self.start_tool(prog_b)'),
+    ('ui safe load',
+     '        try:\n            return MQ.load_box(name)\n        except SystemExit:\n            return None\n',
+     '        try:\n            b = MQ.load_box(name)\n        except (SystemExit, Exception):     # a damaged file must not take the window down\n            return None\n        for k, v in (("template", "alpine"), ("tier", "trusted"), ("color", "#888888"), ("network", "none"),\n                     ("persistent", True), ("shares", []), ("apps", [])):\n            b.setdefault(k, v)\n        return b\n'),
+    ('ui font and errors',
+     '    app.setStyleSheet("QWidget { font-size: 13pt; } QPushButton { padding: 8px 16px; }")\n',
+     '    pt = 13 if app.primaryScreen().availableGeometry().height() >= 900 else 11\n    app.setStyleSheet(f"QWidget {{ font-size: {pt}pt; }} QPushButton {{ padding: {pt - 5}px 14px; }}")\n\n    def on_error(kind, value, tb):          # a bug in one button shouldn\'t close the window\n        import traceback\n        try:\n            log = Path.home() / ".cache" / "miniqubes-gui.log"\n            log.parent.mkdir(parents=True, exist_ok=True)\n            with open(log, "a") as f:\n                f.write("".join(traceback.format_exception(kind, value, tb)) + "\\n")\n            QMessageBox.warning(None, "Something went wrong", f"{value}\\n\\nThe window keeps running. Details: {log}")\n        except Exception:\n            pass\n    sys.excepthook = on_error\n'),
+    ('ui clear layout',
+     '        if w:\n            w.deleteLater()\n',
+     '        if w:\n            w.hide()                 # gone at once, not "later" (no ghost buttons while resizing)\n            w.setParent(None)\n            w.deleteLater()\n'),
+    ('ui group title',
+     'QGroupBox("Base system (admin: changes every qube)")',
+     'QGroupBox("Base system (admin)")'),
 ]
+
+SKIP_IF = {"template row": "self.tpl = QComboBox()", "template install": "Install into which base system?",
+           "settings button": 'self.start_tool("mq-settings")', "usb button": 'self.start_tool("mq-usb")',
+           "tools buttons": "self.start_tool(prog_b)"}
 
 
 def patch_gui(text, say):
     problems = []
     for name, old, new in GUI_EDITS:
-        if new in text:
+        if new in text or SKIP_IF.get(name, "\0") in text:
             continue
         if text.count(old) == 1:
             text = text.replace(old, new)

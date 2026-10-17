@@ -72,8 +72,15 @@ def drives():
     except (ValueError, KeyError):
         return []
     out = []
+    try:                                      # the dead man's switch key is never given to a qube
+        key = json.loads((Path(os.environ.get("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())) / "miniqubes-deadman.json").read_text())["key"]
+        key_disk = os.path.realpath("/dev/disk/by-id/" + key)
+    except (OSError, ValueError, KeyError):
+        key_disk = None
 
     def walk(node, removable, disk, model):
+        if key_disk and (node.get("path") == key_disk or disk == key_disk):
+            return
         removable = removable or truthy(node.get("hotplug")) or truthy(node.get("rm"))
         if node.get("type") == "disk":
             disk, model = node["path"], (node.get("model") or "").strip()

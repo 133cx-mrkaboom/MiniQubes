@@ -1,27 +1,47 @@
 #!/bin/sh
 # mq-clipsync COMMAND...   (runs INSIDE a qube's colored frame; started for you by `miniqubes run`)
 # Shares the text clipboard between this qube and the desktop, both ways, then runs COMMAND.
-# Needs wl-clipboard in the template:  miniqubes template install alpine wl-clipboard
+# Needs wl-clipboard in the template (Manage > Install programs > wl-clipboard).
 # Opt a qube out: put its name in ~/.config/miniqubes/clipboard.deny (one per line).
+# Trouble? Inside the qube:  cat /tmp/mqclip.*/log
 ME=/run/mq-clipsync
+
+# wl-clipboard refuses to start when stdin/stdout/stderr is closed ("launched with a closed standard file
+# descriptor"). Programs that start us can leave one closed, so give every closed one a harmless /dev/null.
+{ : <&0; } 2>/dev/null || exec 0</dev/null
+{ : >&1; } 2>/dev/null || exec 1>/dev/null
+{ : >&2; } 2>/dev/null || exec 2>/dev/null
 
 if [ "$1" = "--push" ]; then            # called by wl-paste on every change; stdin = the new text
   to=$2; f="$MQ_CLIP_STATE/in.$$"
   cat > "$f"
-  if [ -s "$f" ] && ! cmp -s "$f" "$MQ_CLIP_STATE/last"; then
+  # (an explicit type: without it wl-copy guesses, and on a bare Arch template the guess can be one Firefox won't paste)
+  # only plain sh tools here: a small Arch/Debian template may not have cmp/diff
+  new=$(cat "$f"; echo x); old=$(cat "$MQ_CLIP_STATE/last" 2>/dev/null; echo x)
+  if [ -s "$f" ] && [ "$new" != "$old" ]; then
     cp "$f" "$MQ_CLIP_STATE/last"       # remembering it stops the two sides bouncing the same text forever
-    WAYLAND_DISPLAY=$to wl-copy < "$f" >/dev/null 2>&1
+    WAYLAND_DISPLAY=$to wl-copy --type text/plain < "$f" >/dev/null 2>>"$MQ_CLIP_STATE/log" \
+      || echo "wl-copy to $to failed" >> "$MQ_CLIP_STATE/log"
   fi
   rm -f "$f"; exit 0
 fi
 
 HOST=mq-host
-if command -v wl-paste >/dev/null 2>&1 && command -v wl-copy >/dev/null 2>&1 \
-   && [ -n "$WAYLAND_DISPLAY" ] && [ "$WAYLAND_DISPLAY" != "$HOST" ] \
-   && [ -S "${XDG_RUNTIME_DIR:-/run/user/1000}/$HOST" ]; then
-  MQ_CLIP_STATE=$(mktemp -d /tmp/mqclip.XXXXXX) && export MQ_CLIP_STATE
+RT=${XDG_RUNTIME_DIR:-/run/user/1000}
+LOG=$(mktemp -d /tmp/mqclip.XXXXXX 2>/dev/null) && export MQ_CLIP_STATE=$LOG
+say() { [ -n "$LOG" ] && echo "$*" >> "$LOG/log"; }
+if ! command -v wl-paste >/dev/null 2>&1 || ! command -v wl-copy >/dev/null 2>&1; then
+  say "wl-clipboard is not installed in this template"
+elif [ -z "$WAYLAND_DISPLAY" ] || [ "$WAYLAND_DISPLAY" = "$HOST" ]; then
+  say "no colored-frame display here (WAYLAND_DISPLAY='$WAYLAND_DISPLAY')"
+elif [ ! -S "$RT/$HOST" ]; then
+  say "the desktop's clipboard socket is missing: $RT/$HOST"
+elif [ -z "$LOG" ]; then
+  :
+else
   NEST=$WAYLAND_DISPLAY
-  WAYLAND_DISPLAY=$NEST wl-paste --type text --watch "$ME" --push "$HOST" >/dev/null 2>&1 &
-  WAYLAND_DISPLAY=$HOST wl-paste --type text --watch "$ME" --push "$NEST" >/dev/null 2>&1 &
+  say "start: inside=$NEST desktop=$HOST"
+  WAYLAND_DISPLAY=$NEST wl-paste --type text --watch "$ME" --push "$HOST" </dev/null >/dev/null 2>>"$LOG/log" &
+  WAYLAND_DISPLAY=$HOST wl-paste --type text --watch "$ME" --push "$NEST" </dev/null >/dev/null 2>>"$LOG/log" &
 fi
 exec "$@"

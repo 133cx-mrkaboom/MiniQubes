@@ -162,12 +162,18 @@ def build():
     actions["m-manage"] = "miniqubes-gui"
     actions["m-settings"] = "mq-settings"
     actions["m-usb"] = "mq-usb"
+    actions["m-templates"] = "mq-template-manager"
+    actions["m-transfer"] = "mq-transfer"
+    actions["m-dead"] = "mq-deadman"
     sep = '<child><object class="GtkSeparatorMenuItem"><property name="visible">True</property></object></child>'
     rows.append(sep)
     rows.append(f"<child>{item('m-search', 'Search apps / run command…')}</child>")
     rows.append(f"<child>{item('m-manage', 'Manage qubes…')}</child>")
     rows.append(f"<child>{item('m-settings', 'Desktop settings…')}</child>")
     rows.append(f"<child>{item('m-usb', 'USB drives…')}</child>")
+    rows.append(f"<child>{item('m-templates', 'Templates (base systems)…')}</child>")
+    rows.append(f"<child>{item('m-transfer', 'Export / import qubes…')}</child>")
+    rows.append(f"<child>{item('m-dead', 'Dead man’s switch…')}</child>")
     rows.append(sep)
     power = (("p-logout", "Log out", "mq-logout"), ("p-suspend", "Suspend", "systemctl suspend"),
              ("p-reboot", "Restart", "systemctl reboot"), ("p-off", "Shut down", "systemctl poweroff"))

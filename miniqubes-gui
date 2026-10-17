@@ -172,6 +172,8 @@ def clear_layout(layout):
     while layout.count():
         w = layout.takeAt(0).widget()
         if w:
+            w.hide()                 # gone at once, not "later" (no ghost buttons while resizing)
+            w.setParent(None)
             w.deleteLater()
 
 
@@ -212,12 +214,18 @@ class NewQube(QDialog):
         self.kind = QComboBox()
         for key, title, about in KINDS:
             self.kind.addItem(f"{title}: {about}", key)
+        self.tpl = QComboBox()
+        self.tpl.addItem("Default for this type", None)
+        for t_n in sorted(p.name for p in MQ.TEMPLATES.iterdir() if p.is_dir()) if MQ.TEMPLATES.is_dir() else []:
+            self.tpl.addItem(t_n, t_n)
+        self.tpl.setToolTip("Which base system it runs on. Pick a separate one for anything sensitive (Templates... makes them).")
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         form = QFormLayout(self)
         form.addRow("Name", self.name)
         form.addRow("Type", self.kind)
+        form.addRow("Base system", self.tpl)
         form.addRow(bb)
 
     def accept(self):
@@ -232,7 +240,9 @@ class Main(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("MiniQubes")
-        self.resize(1100, 720)
+        scr = QApplication.primaryScreen().availableGeometry()
+        self.resize(min(1100, int(scr.width() * 0.92)), min(720, int(scr.height() * 0.9)))
+        self.setMinimumSize(560, 380)
         self.name = None      # selected qube
         self.color = "#2e7d32"
         self.loading = False  # True while filling widgets from a qube, so changes aren't saved back
@@ -305,6 +315,11 @@ class Main(QMainWindow):
         sf.addRow("Security level", self.security)
         sf.addRow("", self.security_help)
         sf.addRow(self.forget)
+        self.tpl = QComboBox()
+        self.tpl.setToolTip("The base system this qube runs on. Give a sensitive qube (a password vault) its OWN base "
+                            "system (Templates...) so a program installed for another qube can never be part of it.")
+        self.tpl.activated.connect(self.move_template)
+        sf.addRow("Base system", self.tpl)
         sf.addRow(self.frame)
         sf.addRow(self.clip)
         sf.addRow(QLabel("Needs wl-clipboard in the base system: Install programs... and add  wl-clipboard"))
@@ -350,7 +365,15 @@ class Main(QMainWindow):
 
         central = QWidget()
         cl = QHBoxLayout(central)
-        cl.addWidget(left)
+        ls = QScrollArea()                    # the left column scrolls instead of forcing a tall window
+        ls.setWidgetResizable(True)
+        ls.setWidget(left)
+        ls.setFrameShape(QScrollArea.Shape.NoFrame)
+        ls.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        ls.setMinimumWidth(250)
+        ls.setMaximumWidth(320)
+        self.qubes.setMinimumHeight(140)
+        cl.addWidget(ls)
         cl.addWidget(scroll, 1)
         self.setCentralWidget(central)
 
@@ -366,7 +389,7 @@ class Main(QMainWindow):
         adm = QPushButton("Admin shell (root)")
         adm.clicked.connect(self.admin_shell)
         self.admin_btns = [inst, upd, adm]
-        bg = QGroupBox("Base system (admin: changes every qube)")
+        bg = QGroupBox("Base system (admin)")
         bv = QVBoxLayout(bg)
         bv.addWidget(self.tpl_label)
         bv.addWidget(self.build_btn)
@@ -375,12 +398,43 @@ class Main(QMainWindow):
         lv.addWidget(bg)
         sett = QPushButton("Desktop settings...")
         sett.setToolTip("Number of desktops, light/dark, bar, wallpaper, keybinds, system terminal and upgrades")
-        sett.clicked.connect(lambda: subprocess.Popen(["mq-settings"], start_new_session=True))
+        sett.clicked.connect(lambda: self.start_tool("mq-settings"))
         lv.addWidget(sett)
         usbb = QPushButton("USB drives...")
         usbb.setToolTip("Give one qube at a time access to a plugged-in USB drive")
-        usbb.clicked.connect(lambda: subprocess.Popen(["mq-usb"], start_new_session=True))
+        usbb.clicked.connect(lambda: self.start_tool("mq-usb"))
         lv.addWidget(usbb)
+        for text_b, tip_b, prog_b in (
+                ("Templates...", "Make separate base systems (Alpine / Arch / copies), for example one just for a vault", "mq-template-manager"),
+                ("Export / import qubes...", "Take qubes with you on a USB stick, or bring them in", "mq-transfer"),
+                ("Dead man's switch...", "Lock or shut down when a USB key is pulled out", "mq-deadman")):
+            tb = QPushButton(text_b)
+            tb.setToolTip(tip_b)
+            tb.clicked.connect(lambda _=False, prog_b=prog_b: self.start_tool(prog_b))
+            lv.addWidget(tb)
+
+        # ---- tidy-up: one Tools menu instead of a column of buttons, wrapping text, narrow-window friendly
+        from PySide6.QtWidgets import QMenu
+        tools_menu = QMenu(self)
+        for btn in left.findChildren(QPushButton):
+            if btn.text() in ("Desktop settings...", "USB drives...", "Templates...", "Export / import qubes...",
+                              "Dead man's switch..."):
+                act = tools_menu.addAction(btn.text().rstrip("."))
+                act.setToolTip(btn.toolTip())
+                act.triggered.connect(lambda _=False, b=btn: b.click())
+                btn.hide()
+        tools_btn = QPushButton("Tools  \u25be")
+        tools_btn.setMenu(tools_menu)
+        lv.addWidget(tools_btn)
+        for lab in right.findChildren(QLabel):
+            lab.setWordWrap(True)
+        for cb in (self.internet, self.security, self.tpl):
+            cb.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            cb.setMinimumContentsLength(16)
+        sf.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        self.relayout = QTimer(self)
+        self.relayout.setSingleShot(True)
+        self.relayout.timeout.connect(self.relayout_programs)
 
         self.reaper = QTimer(self)
         self.reaper.timeout.connect(self.reap)
@@ -392,9 +446,13 @@ class Main(QMainWindow):
     # ------------------------------------------------------------ data
     def load(self, name):
         try:
-            return MQ.load_box(name)
-        except SystemExit:
+            b = MQ.load_box(name)
+        except (SystemExit, Exception):     # a damaged file must not take the window down
             return None
+        for k, v in (("template", "alpine"), ("tier", "trusted"), ("color", "#888888"), ("network", "none"),
+                     ("persistent", True), ("shares", []), ("apps", [])):
+            b.setdefault(k, v)
+        return b
 
     def programs_of(self, b):
         """[(command string, display name, icon)] for the qube's programs."""
@@ -463,10 +521,37 @@ class Main(QMainWindow):
             self.security.setCurrentIndex(self.security.findData(level))
             self.security_help.setText(describe(level))
             self.fill_shares(b)
+            self.tpl.clear()
+            names = sorted(p.name for p in MQ.TEMPLATES.iterdir() if p.is_dir()) if MQ.TEMPLATES.is_dir() else []
+            cur_t = b.get("template", DEFAULT_TEMPLATE)
+            if cur_t not in names:
+                names.append(cur_t)
+            for n_t in names:
+                self.tpl.addItem(n_t, n_t)
+            self.tpl.setCurrentIndex(self.tpl.findData(cur_t))
             self.fill_programs(b)
             self.notice.setVisible(not (MQ.TEMPLATES / b["template"]).is_dir())
         finally:
             self.loading = False
+
+    def start_tool(self, prog):
+        try:
+            subprocess.Popen([prog], start_new_session=True)
+        except OSError:
+            QMessageBox.warning(self, "Not installed", f"{prog} isn't installed. Run ./install.sh again from the MiniQubes folder.")
+
+    def grid_cols(self):
+        return max(1, min(6, (self.width() - 340) // 175))
+
+    def relayout_programs(self):
+        b = self.load(self.name) if self.name else None
+        if b is not None:
+            self.fill_programs(b)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if hasattr(self, "relayout") and getattr(self, "_cols", None) != self.grid_cols():
+            self.relayout.start(120)
 
     def fill_programs(self, b):
         clear_layout(self.grid)
@@ -474,6 +559,7 @@ class Main(QMainWindow):
         if not progs:
             self.grid.addWidget(QLabel("No programs yet. Click '+ Add program' below."), 0, 0)
             return
+        cols = self._cols = self.grid_cols()
         for i, (cmd, name, icon) in enumerate(progs):
             btn = QToolButton()
             btn.setText(name)
@@ -482,7 +568,7 @@ class Main(QMainWindow):
             btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
             btn.setMinimumSize(150, 130)
             btn.clicked.connect(lambda _=False, c=cmd: self.launch(c))
-            self.grid.addWidget(btn, i // 4, i % 4)
+            self.grid.addWidget(btn, i // cols, i % cols)
 
     def fill_shares(self, b):
         self.shares.clear()
@@ -517,6 +603,8 @@ class Main(QMainWindow):
         b["tier"] = "disposable" if self.forget.isChecked() else "trusted"
         b["frame"] = self.frame.isChecked()
         b["clipboard"] = self.clip.isChecked()
+        if self.tpl.currentData():
+            b["template"] = self.tpl.currentData()
         b["sound"] = self.sound.isChecked()
         b["camera"] = self.camera.isChecked()
         b["seccomp"] = self.security.currentData()
@@ -530,7 +618,8 @@ class Main(QMainWindow):
         if dlg.exec() != QDialog.Accepted:
             return
         name = dlg.name.text().strip()
-        r = subprocess.run([CLI, "create", name, "--preset", dlg.kind.currentData()],
+        r = subprocess.run([CLI, "create", name, "--preset", dlg.kind.currentData(),
+                            *(["--template", dlg.tpl.currentData()] if dlg.tpl.currentData() else [])],
                            capture_output=True, text=True)
         if r.returncode != 0:
             QMessageBox.warning(self, "Couldn't make qube", (r.stdout + r.stderr).strip())
@@ -647,36 +736,109 @@ class Main(QMainWindow):
         script = shlex.join(argv) + '; echo; printf "Done. Press Enter to close... "; read _'
         subprocess.Popen([term, *flags, "sh", "-c", script], start_new_session=True)
 
+    def running_in(self, name):
+        for d in os.scandir("/proc"):
+            if d.name.isdigit():
+                try:
+                    if Path(d.path, "comm").read_text().strip() != "bwrap":
+                        continue
+                    argv = Path(d.path, "cmdline").read_bytes().split(b"\0")
+                except OSError:
+                    continue
+                if b"--setenv" in argv and any(argv[i] == b"MQ_BOX" and argv[i + 1].decode() == name
+                                               for i in range(len(argv) - 1)):
+                    return True
+        return False
+
+    def move_template(self, *_):
+        if self.loading or not self.name:
+            return
+        new_t = self.tpl.currentData()
+        b = self.load(self.name)
+        if b is None or not new_t or new_t == b.get("template"):
+            return
+        old_t = b.get("template")
+        back = lambda: self.tpl.setCurrentIndex(self.tpl.findData(old_t))
+        if self.running_in(self.name):
+            QMessageBox.warning(self, "Move", "Close this qube's programs first.")
+            back()
+            return
+        extra = ""
+        root = MQ.TEMPLATES / new_t
+        if root.is_dir() and b.get("apps"):
+            have = {shlex.join(cmd) for _n, cmd, _i in template_apps(root)}
+            gone = [a for a in b["apps"] if a not in have]
+            if gone:
+                extra = f"\n\n{len(gone)} of its {len(b['apps'])} listed programs are not installed in '{new_t}' yet " \
+                        "and won't start until you install them there."
+        elif not root.is_dir():
+            extra = f"\n\nThe base system '{new_t}' isn't set up yet."
+        if QMessageBox.question(self, "Move to another base system",
+                                f"Move '{self.name}' from base system '{old_t}' to '{new_t}'?\n\n"
+                                "Everything saved in the qube (files, logins, settings) stays exactly as it is. "
+                                "Only the programs underneath change." + extra,
+                                QMessageBox.Yes | QMessageBox.Cancel) != QMessageBox.Yes:
+            back()
+            return
+        b["template"] = new_t
+        MQ.write_box(self.name, b)
+        self.refresh()
+
+    def cur_tpl(self):
+        b = self.load(self.name) if getattr(self, "name", None) else None
+        return (b or {}).get("template") or DEFAULT_TEMPLATE
+
     def build_base(self):
         self.terminal([CLI, "template", "build", DEFAULT_TEMPLATE])
 
     def update_base(self):
-        self.terminal([CLI, "template", "update", DEFAULT_TEMPLATE])
+        self.terminal([CLI, "template", "update", self.cur_tpl()])
 
     def admin_shell(self):
-        self.terminal([CLI, "template", "shell", DEFAULT_TEMPLATE])
+        self.terminal([CLI, "template", "shell", self.cur_tpl()])
 
     def install_program(self):
         text, ok = QInputDialog.getText(
             self, "Install programs", "Package names, space separated (for example: vlc libreoffice).\n"
                                       "For sound, include: libpulse\nFor copy/paste between qubes, include: wl-clipboard\nIdeas: " + SUGGESTIONS)
         if ok and text.strip():
-            self.terminal([CLI, "template", "install", DEFAULT_TEMPLATE, *text.split()])
+            names = sorted(p.name for p in MQ.TEMPLATES.iterdir() if p.is_dir()) if MQ.TEMPLATES.is_dir() else []
+            if not names:
+                QMessageBox.information(self, "Install programs", "No base system exists yet. Set one up first.")
+                return
+            cur_i = names.index(self.cur_tpl()) if self.cur_tpl() in names else 0
+            tpl, ok2 = QInputDialog.getItem(self, "Install programs", "Install into which base system?\n"
+                                            "(Only qubes that use it will see the programs.)", names, cur_i, False)
+            if ok2:
+                self.terminal([CLI, "template", "install", tpl, *text.split()])
 
     def refresh_admin(self):
-        ready = (MQ.TEMPLATES / DEFAULT_TEMPLATE).is_dir()
+        ready = (MQ.TEMPLATES / self.cur_tpl()).is_dir()
         self.build_btn.setVisible(not ready)
         for b in self.admin_btns:
             b.setEnabled(ready)
         self.tpl_label.setText(
-            f"Base system '{DEFAULT_TEMPLATE}' is ready. Programs installed here appear in every qube."
+            f"Base system '{self.cur_tpl()}' is ready. Programs installed here appear in every qube that uses it."
             if ready else "The base system isn't set up yet. Click the button below (first time only).")
 
 
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("MiniQubes")
-    app.setStyleSheet("QWidget { font-size: 13pt; } QPushButton { padding: 8px 16px; }")
+    pt = 13 if app.primaryScreen().availableGeometry().height() >= 900 else 11
+    app.setStyleSheet(f"QWidget {{ font-size: {pt}pt; }} QPushButton {{ padding: {pt - 5}px 14px; }}")
+
+    def on_error(kind, value, tb):          # a bug in one button shouldn't close the window
+        import traceback
+        try:
+            log = Path.home() / ".cache" / "miniqubes-gui.log"
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with open(log, "a") as f:
+                f.write("".join(traceback.format_exception(kind, value, tb)) + "\n")
+            QMessageBox.warning(None, "Something went wrong", f"{value}\n\nThe window keeps running. Details: {log}")
+        except Exception:
+            pass
+    sys.excepthook = on_error
     w = Main()
     w.show()
     sys.exit(app.exec())

@@ -18,6 +18,11 @@ LP="${LABWC_PID:-$PPID}"   # the compositor: everything started here stops when 
 mq-menu --once >/dev/null 2>&1
 mq-menu --daemon "$LP" >/dev/null 2>&1 &
 
+# dead man's switch: ask once per login (turn off in Desktop settings > System)
+if command -v mq-deadman >/dev/null 2>&1 && [ "$(cat "$D/deadman" 2>/dev/null)" != off ]; then
+  ( sleep 4; MQ_LP="$LP" exec mq-deadman --ask ) >/dev/null 2>&1 &
+fi
+
 # clipboard manager (only if installed); it sits in the bar's tray, Super+V opens it
 command -v copyq >/dev/null 2>&1 && copyq --start-server >/dev/null 2>&1 &
 
